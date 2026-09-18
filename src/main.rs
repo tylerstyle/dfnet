@@ -137,7 +137,7 @@ fn run_tui() -> Result<()> {
     loop {
         terminal.draw(|f| {
             let chunks = Layout::default()
-                .direction(Direction::VERTICAL)
+                .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3), // Title
                     Constraint::Length(3), // Tab navigation
