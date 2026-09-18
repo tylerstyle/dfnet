@@ -6,9 +6,10 @@
 , arp-scan
 , cifs-utils
 , nfs-utils
-, netcat
+, netcat-openbsd
 , pv
 , iproute2
+, util-linux
 }:
 
 rustPlatform.buildRustPackage {
@@ -31,9 +32,10 @@ rustPlatform.buildRustPackage {
         arp-scan
         cifs-utils
         nfs-utils
-        netcat
+        netcat-openbsd
         pv
         iproute2
+        util-linux
       ]}
   '';
 
