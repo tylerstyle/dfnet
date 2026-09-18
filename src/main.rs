@@ -315,7 +315,6 @@ fn run_tui() -> Result<()> {
                         ifaces = fetch_interfaces();
                     }
                     KeyCode::Char('s') => {
-                        status_msg = "Running ARP subnet scan...".to_string();
                         match scan_subnet(None) {
                             Ok(res) => {
                                 scan_results = res;
