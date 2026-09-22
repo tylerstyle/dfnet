@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -10,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row, Table, TableState, Tabs},
+    widgets::{Block, BorderType, Borders, Paragraph, Row, Table, TableState, Tabs},
     Terminal,
 };
 use std::{
@@ -271,25 +274,39 @@ fn fetch_connected_clients(iface: &str) -> Vec<(String, String)> {
 }
 
 fn run_tui() -> Result<()> {
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        default_panic(info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut current_tab = 0;
-    let tabs = vec![
-        "Interfaces & MAC Cloaking",
-        "Local Network Discovery",
-        "Stream Receiver",
-        "Wi-Fi Hotspot / AP",
+
+    struct TabCategory {
+        badge: &'static str,
+        icon: &'static str,
+        title: &'static str,
+    }
+
+    let tab_categories = [
+        TabCategory { badge: "1", icon: "🌐", title: "Interfaces & MAC Cloaking" },
+        TabCategory { badge: "2", icon: "🔍", title: "Subnet Discovery & ARP" },
+        TabCategory { badge: "3", icon: "⚡", title: "Stream Receiver" },
+        TabCategory { badge: "4", icon: "📡", title: "Wi-Fi Hotspot / AP" },
     ];
 
     let mut ifaces = fetch_interfaces();
     let mut table_state = TableState::default();
     table_state.select(Some(0));
 
-    let mut status_msg = String::from("Ready. Select interface with j/k or ↑/↓.");
+    let mut status_msg = String::from("Ready. Click tabs or navigate with [1-4], [Tab], or [j/k].");
     let mut is_error = false;
     let mut scan_results = String::from("Press [S] to run local ARP discovery scan.");
 
@@ -300,6 +317,9 @@ fn run_tui() -> Result<()> {
     let mut hotspot_pass = String::from("forensics123");
     let mut hotspot_selected_field = 0usize; // 0=Interface, 1=SSID, 2=Password, 3=Action
     let mut is_editing_text = false;
+
+    let mut tab_bounds: Vec<(u16, u16)> = Vec::new();
+    let mut last_chunks = [ratatui::layout::Rect::default(); 5];
 
     loop {
         terminal.draw(|f| {
@@ -314,21 +334,102 @@ fn run_tui() -> Result<()> {
                 ])
                 .split(f.area());
 
+            last_chunks[0] = chunks[0];
+            last_chunks[1] = chunks[1];
+            last_chunks[2] = chunks[2];
+            last_chunks[3] = chunks[3];
+            last_chunks[4] = chunks[4];
+
             // 1. Title
             let title = Paragraph::new(Line::from(vec![
                 Span::styled(" dfnet ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::raw("— Forensic Network Triage, Stealth Cloaking, Share Ingest & Wi-Fi AP TUI"),
             ]))
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
             f.render_widget(title, chunks[0]);
 
             // 2. Tabs
-            let tab_titles: Vec<Line> = tabs.iter().map(|t| Line::from(*t)).collect();
-            let tabs_widget = Tabs::new(tab_titles)
+            let tabs_block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Line::from(vec![
+                    Span::styled(" ◈ CATEGORIES ◈ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(" [Click tab or press 1-4 / Tab] ", Style::default().fg(Color::DarkGray)),
+                ]))
+                .border_style(Style::default().fg(Color::DarkGray));
+
+            let inner_tabs = tabs_block.inner(chunks[1]);
+            tab_bounds.clear();
+            let mut cur_x = inner_tabs.x;
+
+            let tab_lines: Vec<Line> = tab_categories
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let is_sel = i == current_tab;
+                    let line = if is_sel {
+                        Line::from(vec![
+                            Span::raw(" "),
+                            Span::styled(
+                                format!(" {} ", t.badge),
+                                Style::default()
+                                    .bg(Color::Cyan)
+                                    .fg(Color::Black)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(" ", Style::default().bg(Color::Rgb(20, 50, 75))),
+                            Span::styled(
+                                format!("{} ", t.icon),
+                                Style::default().bg(Color::Rgb(20, 50, 75)),
+                            ),
+                            Span::styled(
+                                format!("{} ", t.title),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(Color::Rgb(20, 50, 75))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled("● ", Style::default().fg(Color::Cyan).bg(Color::Rgb(20, 50, 75))),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::raw(" "),
+                            Span::styled(
+                                format!(" {} ", t.badge),
+                                Style::default()
+                                    .bg(Color::Rgb(35, 40, 50))
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(" "),
+                            Span::styled(
+                                format!("{} ", t.icon),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                format!("{} ", t.title),
+                                Style::default().fg(Color::Gray),
+                            ),
+                            Span::raw(" "),
+                        ])
+                    };
+
+                    let w = line.width() as u16;
+                    tab_bounds.push((cur_x, cur_x + w));
+                    cur_x += w + 3; // +3 for divider " │ "
+                    line
+                })
+                .collect();
+
+            let tabs_widget = Tabs::new(tab_lines)
                 .select(current_tab)
-                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
-                .style(Style::default().fg(Color::Gray))
-                .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                .divider(Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 70, 85))))
+                .block(tabs_block);
             f.render_widget(tabs_widget, chunks[1]);
 
             // 3. Tab Content
@@ -569,18 +670,23 @@ fn run_tui() -> Result<()> {
                 Span::styled(" >> ", Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
                 Span::styled(&status_msg, Style::default().fg(status_color)),
             ]))
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
             f.render_widget(status_p, chunks[3]);
 
             // 5. Hotkeys Footer
             let footer = if current_tab == 3 {
                 Paragraph::new(Line::from(vec![
-                    Span::styled(" [Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("Next Tab  "),
+                    Span::styled(" [Click / 1-4 / Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("Category  "),
                     Span::styled(" [↑/↓] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("Select Field  "),
+                    Span::raw("Field  "),
                     Span::styled(" [←/→] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("Select Adapter  "),
+                    Span::raw("Adapter  "),
                     Span::styled(" [Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::raw("Edit/Apply  "),
                     Span::styled(" [Space/H] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -592,8 +698,8 @@ fn run_tui() -> Result<()> {
                 ]))
             } else {
                 Paragraph::new(Line::from(vec![
-                    Span::styled(" [Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("Next Tab  "),
+                    Span::styled(" [Click / 1-4 / Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("Category  "),
                     Span::styled(" [M] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::raw("Random MAC  "),
                     Span::styled(" [P] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -612,80 +718,214 @@ fn run_tui() -> Result<()> {
         })?;
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if current_tab == 3 && is_editing_text {
-                    match key.code {
-                        KeyCode::Esc => {
-                            is_editing_text = false;
-                            status_msg = "Editing cancelled.".to_string();
-                        }
-                        KeyCode::Enter => {
-                            is_editing_text = false;
-                            status_msg = "Configuration value saved.".to_string();
-                            is_error = false;
-                        }
-                        KeyCode::Backspace => {
-                            if hotspot_selected_field == 1 {
-                                hotspot_ssid.pop();
-                            } else if hotspot_selected_field == 2 {
-                                hotspot_pass.pop();
+            match event::read()? {
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            // 1. Check if clicked inside Tab Categories (last_chunks[1])
+                            if mouse.row >= last_chunks[1].y && mouse.row < last_chunks[1].y + last_chunks[1].height {
+                                for (idx, (start_x, end_x)) in tab_bounds.iter().enumerate() {
+                                    let min_x = if idx == 0 { 0 } else { start_x.saturating_sub(1) };
+                                    let max_x = if idx + 1 < tab_bounds.len() {
+                                        tab_bounds[idx + 1].0
+                                    } else {
+                                        (*end_x + 3).min(last_chunks[1].x + last_chunks[1].width)
+                                    };
+                                    if mouse.column >= min_x && mouse.column < max_x {
+                                        current_tab = idx;
+                                        is_editing_text = false;
+                                        status_msg = format!("Switched to: {}", tab_categories[idx].title);
+                                        is_error = false;
+                                        break;
+                                    }
+                                }
+                            } else if current_tab == 0 {
+                                // 2. Check if clicked on Network Adapters table (last_chunks[2])
+                                let table_content_start = last_chunks[2].y + 2;
+                                let table_content_end = last_chunks[2].y + last_chunks[2].height.saturating_sub(1);
+                                if mouse.row >= table_content_start && mouse.row < table_content_end {
+                                    let clicked_row = (mouse.row - table_content_start) as usize;
+                                    if clicked_row < ifaces.len() {
+                                        table_state.select(Some(clicked_row));
+                                        status_msg = format!("Selected interface: {}", ifaces[clicked_row].name);
+                                        is_error = false;
+                                    }
+                                }
+                            } else if current_tab == 3 {
+                                // 3. Check if clicked in Wi-Fi Hotspot configuration fields
+                                let h_chunks = Layout::default()
+                                    .direction(Direction::Horizontal)
+                                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                                    .split(last_chunks[2]);
+                                if mouse.column >= h_chunks[0].x && mouse.column < h_chunks[0].x + h_chunks[0].width {
+                                    let top = h_chunks[0].y + 1;
+                                    if mouse.row == top + 1 {
+                                        hotspot_selected_field = 0;
+                                        is_editing_text = false;
+                                    } else if mouse.row == top + 3 {
+                                        hotspot_selected_field = 1;
+                                        is_editing_text = true;
+                                        status_msg = "Type new SSID. Press Enter to confirm, Esc to cancel.".to_string();
+                                    } else if mouse.row == top + 5 {
+                                        hotspot_selected_field = 2;
+                                        is_editing_text = true;
+                                        status_msg = "Type new Password (≥8 chars). Press Enter to confirm, Esc to cancel.".to_string();
+                                    } else if mouse.row == top + 7 || mouse.row == top + 8 {
+                                        hotspot_selected_field = 3;
+                                        is_editing_text = false;
+                                    }
+                                }
                             }
                         }
-                        KeyCode::Char(c) => {
-                            if hotspot_selected_field == 1 {
-                                hotspot_ssid.push(c);
-                            } else if hotspot_selected_field == 2 {
-                                hotspot_pass.push(c);
+                        MouseEventKind::ScrollDown => {
+                            if mouse.row >= last_chunks[1].y && mouse.row < last_chunks[1].y + last_chunks[1].height {
+                                current_tab = (current_tab + 1) % tab_categories.len();
+                                is_editing_text = false;
+                                status_msg = format!("Switched to: {}", tab_categories[current_tab].title);
+                            } else if current_tab == 0 {
+                                let i = match table_state.selected() {
+                                    Some(i) => if i + 1 < ifaces.len() { i + 1 } else { 0 },
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                        }
+                        MouseEventKind::ScrollUp => {
+                            if mouse.row >= last_chunks[1].y && mouse.row < last_chunks[1].y + last_chunks[1].height {
+                                current_tab = if current_tab > 0 { current_tab - 1 } else { tab_categories.len() - 1 };
+                                is_editing_text = false;
+                                status_msg = format!("Switched to: {}", tab_categories[current_tab].title);
+                            } else if current_tab == 0 {
+                                let i = match table_state.selected() {
+                                    Some(i) => if i > 0 { i - 1 } else { ifaces.len().saturating_sub(1) },
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
                             }
                         }
                         _ => {}
                     }
-                    continue;
                 }
+                Event::Key(key) => {
+                    if current_tab == 3 && is_editing_text {
+                        match key.code {
+                            KeyCode::Esc => {
+                                is_editing_text = false;
+                                status_msg = "Editing cancelled.".to_string();
+                            }
+                            KeyCode::Enter => {
+                                is_editing_text = false;
+                                status_msg = "Configuration value saved.".to_string();
+                                is_error = false;
+                            }
+                            KeyCode::Backspace => {
+                                if hotspot_selected_field == 1 {
+                                    hotspot_ssid.pop();
+                                } else if hotspot_selected_field == 2 {
+                                    hotspot_pass.pop();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                if hotspot_selected_field == 1 {
+                                    hotspot_ssid.push(c);
+                                } else if hotspot_selected_field == 2 {
+                                    hotspot_pass.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
 
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Tab => {
-                        current_tab = (current_tab + 1) % tabs.len();
-                        is_editing_text = false;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if current_tab == 0 {
-                            let i = match table_state.selected() {
-                                Some(i) => if i > 0 { i - 1 } else { ifaces.len().saturating_sub(1) },
-                                None => 0,
-                            };
-                            table_state.select(Some(i));
-                        } else if current_tab == 3 {
-                            hotspot_selected_field = if hotspot_selected_field > 0 { hotspot_selected_field - 1 } else { 3 };
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Tab => {
+                            current_tab = (current_tab + 1) % tab_categories.len();
+                            is_editing_text = false;
                         }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if current_tab == 0 {
-                            let i = match table_state.selected() {
-                                Some(i) => if i < ifaces.len().saturating_sub(1) { i + 1 } else { 0 },
-                                None => 0,
-                            };
-                            table_state.select(Some(i));
-                        } else if current_tab == 3 {
-                            hotspot_selected_field = if hotspot_selected_field < 3 { hotspot_selected_field + 1 } else { 0 };
+                        KeyCode::BackTab => {
+                            current_tab = if current_tab > 0 { current_tab - 1 } else { tab_categories.len() - 1 };
+                            is_editing_text = false;
                         }
-                    }
-                    KeyCode::Left | KeyCode::Char('h') if current_tab == 3 => {
-                        if hotspot_selected_field == 0 && !wifi_devs.is_empty() {
-                            selected_wifi_idx = if selected_wifi_idx > 0 { selected_wifi_idx - 1 } else { wifi_devs.len() - 1 };
+                        KeyCode::Char('1') => {
+                            current_tab = 0;
+                            is_editing_text = false;
+                            status_msg = format!("Switched to: {}", tab_categories[0].title);
+                            is_error = false;
                         }
-                    }
-                    KeyCode::Right | KeyCode::Char('l') if current_tab == 3 => {
-                        if hotspot_selected_field == 0 && !wifi_devs.is_empty() {
-                            selected_wifi_idx = if selected_wifi_idx + 1 < wifi_devs.len() { selected_wifi_idx + 1 } else { 0 };
+                        KeyCode::Char('2') => {
+                            current_tab = 1;
+                            is_editing_text = false;
+                            status_msg = format!("Switched to: {}", tab_categories[1].title);
+                            is_error = false;
                         }
-                    }
-                    KeyCode::Enter if current_tab == 3 => {
-                        if hotspot_selected_field == 1 || hotspot_selected_field == 2 {
-                            is_editing_text = true;
-                            status_msg = "Type new value. Press Enter to confirm, Esc to cancel.".to_string();
-                        } else if hotspot_selected_field == 3 {
+                        KeyCode::Char('3') => {
+                            current_tab = 2;
+                            is_editing_text = false;
+                            status_msg = format!("Switched to: {}", tab_categories[2].title);
+                            is_error = false;
+                        }
+                        KeyCode::Char('4') => {
+                            current_tab = 3;
+                            is_editing_text = false;
+                            status_msg = format!("Switched to: {}", tab_categories[3].title);
+                            is_error = false;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if current_tab == 0 {
+                                let i = match table_state.selected() {
+                                    Some(i) => if i > 0 { i - 1 } else { ifaces.len().saturating_sub(1) },
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            } else if current_tab == 3 {
+                                hotspot_selected_field = if hotspot_selected_field > 0 { hotspot_selected_field - 1 } else { 3 };
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if current_tab == 0 {
+                                let i = match table_state.selected() {
+                                    Some(i) => if i < ifaces.len().saturating_sub(1) { i + 1 } else { 0 },
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            } else if current_tab == 3 {
+                                hotspot_selected_field = if hotspot_selected_field < 3 { hotspot_selected_field + 1 } else { 0 };
+                            }
+                        }
+                        KeyCode::Left | KeyCode::Char('h') if current_tab == 3 => {
+                            if hotspot_selected_field == 0 && !wifi_devs.is_empty() {
+                                selected_wifi_idx = if selected_wifi_idx > 0 { selected_wifi_idx - 1 } else { wifi_devs.len() - 1 };
+                            }
+                        }
+                        KeyCode::Right | KeyCode::Char('l') if current_tab == 3 => {
+                            if hotspot_selected_field == 0 && !wifi_devs.is_empty() {
+                                selected_wifi_idx = if selected_wifi_idx + 1 < wifi_devs.len() { selected_wifi_idx + 1 } else { 0 };
+                            }
+                        }
+                        KeyCode::Enter if current_tab == 3 => {
+                            if hotspot_selected_field == 1 || hotspot_selected_field == 2 {
+                                is_editing_text = true;
+                                status_msg = "Type new value. Press Enter to confirm, Esc to cancel.".to_string();
+                            } else if hotspot_selected_field == 3 {
+                                let cur_iface = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+                                if let Some(iface) = cur_iface {
+                                    let (is_active, _, _) = is_hotspot_active(Some(iface));
+                                    if is_active {
+                                        match stop_hotspot(Some(iface)) {
+                                            Ok(msg) => { status_msg = msg; is_error = false; }
+                                            Err(e) => { status_msg = format!("Failed to stop: {}", e); is_error = true; }
+                                        }
+                                    } else {
+                                        match start_hotspot(iface, &hotspot_ssid, &hotspot_pass) {
+                                            Ok(msg) => { status_msg = msg; is_error = false; }
+                                            Err(e) => { status_msg = format!("Failed to start: {}", e); is_error = true; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char(' ') if current_tab == 3 => {
                             let cur_iface = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
                             if let Some(iface) = cur_iface {
                                 let (is_active, _, _) = is_hotspot_active(Some(iface));
@@ -702,96 +942,80 @@ fn run_tui() -> Result<()> {
                                 }
                             }
                         }
-                    }
-                    KeyCode::Char(' ') if current_tab == 3 => {
-                        let cur_iface = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
-                        if let Some(iface) = cur_iface {
-                            let (is_active, _, _) = is_hotspot_active(Some(iface));
-                            if is_active {
-                                match stop_hotspot(Some(iface)) {
-                                    Ok(msg) => { status_msg = msg; is_error = false; }
-                                    Err(e) => { status_msg = format!("Failed to stop: {}", e); is_error = true; }
+                        KeyCode::Char('r') => {
+                            ifaces = fetch_interfaces();
+                            wifi_devs = fetch_wifi_devices();
+                            if selected_wifi_idx >= wifi_devs.len() && !wifi_devs.is_empty() {
+                                selected_wifi_idx = wifi_devs.len() - 1;
+                            }
+                            status_msg = "Refreshed network and wireless interfaces.".to_string();
+                            is_error = false;
+                        }
+                        KeyCode::Char('m') if current_tab == 0 => {
+                            if let Some(idx) = table_state.selected() {
+                                if let Some(iface) = ifaces.get(idx) {
+                                    match spoof_mac(&iface.name) {
+                                        Ok(msg) => { status_msg = msg; is_error = false; }
+                                        Err(e) => { status_msg = e.to_string(); is_error = true; }
+                                    }
+                                    ifaces = fetch_interfaces();
                                 }
-                            } else {
-                                match start_hotspot(iface, &hotspot_ssid, &hotspot_pass) {
-                                    Ok(msg) => { status_msg = msg; is_error = false; }
-                                    Err(e) => { status_msg = format!("Failed to start: {}", e); is_error = true; }
+                            }
+                        }
+                        KeyCode::Char('p') if current_tab == 0 => {
+                            if let Some(idx) = table_state.selected() {
+                                if let Some(iface) = ifaces.get(idx) {
+                                    match restore_mac(&iface.name) {
+                                        Ok(msg) => { status_msg = msg; is_error = false; }
+                                        Err(e) => { status_msg = e.to_string(); is_error = true; }
+                                    }
+                                    ifaces = fetch_interfaces();
                                 }
                             }
                         }
-                    }
-                    KeyCode::Char('r') => {
-                        ifaces = fetch_interfaces();
-                        wifi_devs = fetch_wifi_devices();
-                        if selected_wifi_idx >= wifi_devs.len() && !wifi_devs.is_empty() {
-                            selected_wifi_idx = wifi_devs.len() - 1;
+                        KeyCode::Char('n') => {
+                            disable_raw_mode()?;
+                            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                            let _ = Command::new("nmtui").status();
+                            enable_raw_mode()?;
+                            execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+                            terminal.clear()?;
+                            ifaces = fetch_interfaces();
+                            wifi_devs = fetch_wifi_devices();
                         }
-                        status_msg = "Refreshed network and wireless interfaces.".to_string();
-                        is_error = false;
-                    }
-                    KeyCode::Char('m') if current_tab == 0 => {
-                        if let Some(idx) = table_state.selected() {
-                            if let Some(iface) = ifaces.get(idx) {
-                                match spoof_mac(&iface.name) {
-                                    Ok(msg) => { status_msg = msg; is_error = false; }
-                                    Err(e) => { status_msg = e.to_string(); is_error = true; }
+                        KeyCode::Char('s') => {
+                            match scan_subnet(None) {
+                                Ok(res) => {
+                                    scan_results = res;
+                                    current_tab = 1;
+                                    status_msg = "Subnet scan complete.".to_string();
+                                    is_error = false;
                                 }
-                                ifaces = fetch_interfaces();
-                            }
-                        }
-                    }
-                    KeyCode::Char('p') if current_tab == 0 => {
-                        if let Some(idx) = table_state.selected() {
-                            if let Some(iface) = ifaces.get(idx) {
-                                match restore_mac(&iface.name) {
-                                    Ok(msg) => { status_msg = msg; is_error = false; }
-                                    Err(e) => { status_msg = e.to_string(); is_error = true; }
+                                Err(e) => {
+                                    status_msg = format!("Scan failed: {}", e);
+                                    is_error = true;
                                 }
-                                ifaces = fetch_interfaces();
                             }
                         }
-                    }
-                    KeyCode::Char('n') => {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        let _ = Command::new("nmtui").status();
-                        enable_raw_mode()?;
-                        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                        terminal.clear()?;
-                        ifaces = fetch_interfaces();
-                        wifi_devs = fetch_wifi_devices();
-                    }
-                    KeyCode::Char('s') => {
-                        match scan_subnet(None) {
-                            Ok(res) => {
-                                scan_results = res;
-                                current_tab = 1;
-                                status_msg = "Subnet scan complete.".to_string();
-                                is_error = false;
-                            }
-                            Err(e) => {
-                                status_msg = format!("Scan failed: {}", e);
-                                is_error = true;
-                            }
+                        KeyCode::Char('l') if current_tab == 2 => {
+                            disable_raw_mode()?;
+                            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                            println!("Listening on port 9999 for incoming raw disk stream...");
+                            let _ = Command::new("dfnet").args(["receive"]).status();
+                            enable_raw_mode()?;
+                            execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+                            terminal.clear()?;
                         }
+                        _ => {}
                     }
-                    KeyCode::Char('l') if current_tab == 2 => {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        println!("Listening on port 9999 for incoming raw disk stream...");
-                        let _ = Command::new("dfnet").args(["receive"]).status();
-                        enable_raw_mode()?;
-                        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                        terminal.clear()?;
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
 }
 
