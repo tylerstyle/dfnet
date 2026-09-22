@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -23,7 +22,11 @@ use std::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "dfnet", version, about = "Modern Forensic Network Triage, Stealth MAC Cloaking, Share Ingest & Wi-Fi AP TUI")]
+#[command(
+    name = "dfnet",
+    version,
+    about = "Modern Forensic Network Triage, Stealth MAC Cloaking, Share Ingest & Wi-Fi AP TUI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -38,11 +41,18 @@ enum Commands {
     /// Scan local subnet for active hosts, NAS appliances and storage ports
     Scan { iface: Option<String> },
     /// Mount an on-premise SMB/CIFS share read-only into /media/target/
-    Smb { remote: String, name: String, user: Option<String> },
+    Smb {
+        remote: String,
+        name: String,
+        user: Option<String>,
+    },
     /// Mount an on-premise NFS export read-only into /media/target/
     Nfs { remote: String, name: String },
     /// Listen on network port to receive raw streamed disk image
-    Receive { port: Option<u16>, out: Option<String> },
+    Receive {
+        port: Option<u16>,
+        out: Option<String>,
+    },
     /// Create, stop, or inspect forensic Wi-Fi Access Point (Hotspot)
     Hotspot {
         #[command(subcommand)]
@@ -96,19 +106,34 @@ fn fetch_interfaces() -> Vec<NetInterface> {
             if parts.len() >= 2 {
                 let name = parts[0].to_string();
                 let state = parts[1].to_string();
-                let ip = if parts.len() >= 3 { parts[2].to_string() } else { "-".to_string() };
-
-                // Get MAC
-                let link_out = Command::new("ip").args(["-br", "link", "show", &name]).output();
-                let mac = if let Ok(lout) = link_out {
-                    let ltext = String::from_utf8_lossy(&lout.stdout);
-                    let lparts: Vec<&str> = ltext.split_whitespace().collect();
-                    if lparts.len() >= 3 { lparts[2].to_string() } else { "-".to_string() }
+                let ip = if parts.len() >= 3 {
+                    parts[2].to_string()
                 } else {
                     "-".to_string()
                 };
 
-                ifaces.push(NetInterface { name, state, mac, ip });
+                // Get MAC
+                let link_out = Command::new("ip")
+                    .args(["-br", "link", "show", &name])
+                    .output();
+                let mac = if let Ok(lout) = link_out {
+                    let ltext = String::from_utf8_lossy(&lout.stdout);
+                    let lparts: Vec<&str> = ltext.split_whitespace().collect();
+                    if lparts.len() >= 3 {
+                        lparts[2].to_string()
+                    } else {
+                        "-".to_string()
+                    }
+                } else {
+                    "-".to_string()
+                };
+
+                ifaces.push(NetInterface {
+                    name,
+                    state,
+                    mac,
+                    ip,
+                });
             }
         }
     }
@@ -127,8 +152,16 @@ fn fetch_wifi_devices() -> Vec<WifiDevice> {
             if parts.len() >= 3 && parts[1] == "wifi" {
                 let name = parts[0].to_string();
                 let state = parts[2].to_string();
-                let connection = if parts.len() >= 4 { parts[3].to_string() } else { String::new() };
-                devs.push(WifiDevice { name, state, connection });
+                let connection = if parts.len() >= 4 {
+                    parts[3].to_string()
+                } else {
+                    String::new()
+                };
+                devs.push(WifiDevice {
+                    name,
+                    state,
+                    connection,
+                });
             }
         }
     }
@@ -154,22 +187,33 @@ fn fetch_wifi_devices() -> Vec<WifiDevice> {
 }
 
 fn spoof_mac(iface: &str) -> Result<String> {
-    let _ = Command::new("ip").args(["link", "set", "dev", iface, "down"]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "dev", iface, "down"])
+        .status();
     let res = Command::new("macchanger").args(["-r", iface]).output();
-    let _ = Command::new("ip").args(["link", "set", "dev", iface, "up"]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "dev", iface, "up"])
+        .status();
 
     if let Ok(out) = res {
         if out.status.success() {
             return Ok(format!("Randomized and cloaked MAC address on {}", iface));
         }
     }
-    anyhow::bail!("Failed to spoof MAC on {}. Ensure macchanger is installed.", iface)
+    anyhow::bail!(
+        "Failed to spoof MAC on {}. Ensure macchanger is installed.",
+        iface
+    )
 }
 
 fn restore_mac(iface: &str) -> Result<String> {
-    let _ = Command::new("ip").args(["link", "set", "dev", iface, "down"]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "dev", iface, "down"])
+        .status();
     let res = Command::new("macchanger").args(["-p", iface]).output();
-    let _ = Command::new("ip").args(["link", "set", "dev", iface, "up"]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "dev", iface, "up"])
+        .status();
 
     if let Ok(out) = res {
         if out.status.success() {
@@ -193,14 +237,22 @@ fn start_hotspot(iface: &str, ssid: &str, password: &str) -> Result<String> {
     if password.len() < 8 {
         anyhow::bail!("Wi-Fi WPA2 password must be at least 8 characters long.");
     }
-    let _ = Command::new("nmcli").args(["connection", "delete", "id", "dfnet-hotspot"]).output();
+    let _ = Command::new("nmcli")
+        .args(["connection", "delete", "id", "dfnet-hotspot"])
+        .output();
     let output = Command::new("nmcli")
         .args([
-            "device", "wifi", "hotspot",
-            "ifname", iface,
-            "con-name", "dfnet-hotspot",
-            "ssid", ssid,
-            "password", password,
+            "device",
+            "wifi",
+            "hotspot",
+            "ifname",
+            iface,
+            "con-name",
+            "dfnet-hotspot",
+            "ssid",
+            ssid,
+            "password",
+            password,
         ])
         .output()
         .context("Failed to run nmcli device wifi hotspot")?;
@@ -214,17 +266,30 @@ fn start_hotspot(iface: &str, ssid: &str, password: &str) -> Result<String> {
 }
 
 fn stop_hotspot(iface: Option<&str>) -> Result<String> {
-    let _ = Command::new("nmcli").args(["connection", "down", "id", "dfnet-hotspot"]).output();
-    let _ = Command::new("nmcli").args(["connection", "delete", "id", "dfnet-hotspot"]).output();
+    let _ = Command::new("nmcli")
+        .args(["connection", "down", "id", "dfnet-hotspot"])
+        .output();
+    let _ = Command::new("nmcli")
+        .args(["connection", "delete", "id", "dfnet-hotspot"])
+        .output();
     if let Some(i) = iface {
-        let _ = Command::new("nmcli").args(["device", "disconnect", i]).output();
+        let _ = Command::new("nmcli")
+            .args(["device", "disconnect", i])
+            .output();
     }
     Ok("Wi-Fi Hotspot stopped.".to_string())
 }
 
 fn is_hotspot_active(iface: Option<&str>) -> (bool, Option<String>, Option<String>) {
     if let Ok(output) = Command::new("nmcli")
-        .args(["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+        .args([
+            "-t",
+            "-f",
+            "NAME,TYPE,DEVICE",
+            "connection",
+            "show",
+            "--active",
+        ])
         .output()
     {
         let text = String::from_utf8_lossy(&output.stdout);
@@ -232,7 +297,7 @@ fn is_hotspot_active(iface: Option<&str>) -> (bool, Option<String>, Option<Strin
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() >= 3 && (parts[1] == "802-11-wireless" || parts[1] == "wifi") {
                 let dev_name = parts[2];
-                if iface.map_or(true, |i| i == dev_name) {
+                if iface.is_none_or(|i| i == dev_name) {
                     let ip = get_interface_ip(dev_name);
                     return (true, ip, Some(parts[0].to_string()));
                 }
@@ -243,7 +308,10 @@ fn is_hotspot_active(iface: Option<&str>) -> (bool, Option<String>, Option<Strin
 }
 
 fn get_interface_ip(iface: &str) -> Option<String> {
-    if let Ok(output) = Command::new("ip").args(["-br", "addr", "show", iface]).output() {
+    if let Ok(output) = Command::new("ip")
+        .args(["-br", "addr", "show", iface])
+        .output()
+    {
         let text = String::from_utf8_lossy(&output.stdout);
         if let Some(line) = text.lines().next() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -257,7 +325,10 @@ fn get_interface_ip(iface: &str) -> Option<String> {
 
 fn fetch_connected_clients(iface: &str) -> Vec<(String, String)> {
     let mut clients = Vec::new();
-    if let Ok(output) = Command::new("ip").args(["neigh", "show", "dev", iface]).output() {
+    if let Ok(output) = Command::new("ip")
+        .args(["neigh", "show", "dev", iface])
+        .output()
+    {
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -296,10 +367,26 @@ fn run_tui() -> Result<()> {
     }
 
     let tab_categories = [
-        TabCategory { badge: "1", icon: "🌐", title: "Interfaces & MAC Cloaking" },
-        TabCategory { badge: "2", icon: "🔍", title: "Subnet Discovery & ARP" },
-        TabCategory { badge: "3", icon: "⚡", title: "Stream Receiver" },
-        TabCategory { badge: "4", icon: "📡", title: "Wi-Fi Hotspot / AP" },
+        TabCategory {
+            badge: "1",
+            icon: "🌐",
+            title: "Interfaces & MAC Cloaking",
+        },
+        TabCategory {
+            badge: "2",
+            icon: "🔍",
+            title: "Subnet Discovery & ARP",
+        },
+        TabCategory {
+            badge: "3",
+            icon: "⚡",
+            title: "Stream Receiver",
+        },
+        TabCategory {
+            badge: "4",
+            icon: "📡",
+            title: "Wi-Fi Hotspot / AP",
+        },
     ];
 
     let mut ifaces = fetch_interfaces();
@@ -723,9 +810,15 @@ fn run_tui() -> Result<()> {
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             // 1. Check if clicked inside Tab Categories (last_chunks[1])
-                            if mouse.row >= last_chunks[1].y && mouse.row < last_chunks[1].y + last_chunks[1].height {
+                            if mouse.row >= last_chunks[1].y
+                                && mouse.row < last_chunks[1].y + last_chunks[1].height
+                            {
                                 for (idx, (start_x, end_x)) in tab_bounds.iter().enumerate() {
-                                    let min_x = if idx == 0 { 0 } else { start_x.saturating_sub(1) };
+                                    let min_x = if idx == 0 {
+                                        0
+                                    } else {
+                                        start_x.saturating_sub(1)
+                                    };
                                     let max_x = if idx + 1 < tab_bounds.len() {
                                         tab_bounds[idx + 1].0
                                     } else {
@@ -734,7 +827,8 @@ fn run_tui() -> Result<()> {
                                     if mouse.column >= min_x && mouse.column < max_x {
                                         current_tab = idx;
                                         is_editing_text = false;
-                                        status_msg = format!("Switched to: {}", tab_categories[idx].title);
+                                        status_msg =
+                                            format!("Switched to: {}", tab_categories[idx].title);
                                         is_error = false;
                                         break;
                                     }
@@ -742,12 +836,17 @@ fn run_tui() -> Result<()> {
                             } else if current_tab == 0 {
                                 // 2. Check if clicked on Network Adapters table (last_chunks[2])
                                 let table_content_start = last_chunks[2].y + 2;
-                                let table_content_end = last_chunks[2].y + last_chunks[2].height.saturating_sub(1);
-                                if mouse.row >= table_content_start && mouse.row < table_content_end {
+                                let table_content_end =
+                                    last_chunks[2].y + last_chunks[2].height.saturating_sub(1);
+                                if mouse.row >= table_content_start && mouse.row < table_content_end
+                                {
                                     let clicked_row = (mouse.row - table_content_start) as usize;
                                     if clicked_row < ifaces.len() {
                                         table_state.select(Some(clicked_row));
-                                        status_msg = format!("Selected interface: {}", ifaces[clicked_row].name);
+                                        status_msg = format!(
+                                            "Selected interface: {}",
+                                            ifaces[clicked_row].name
+                                        );
                                         is_error = false;
                                     }
                                 }
@@ -755,9 +854,14 @@ fn run_tui() -> Result<()> {
                                 // 3. Check if clicked in Wi-Fi Hotspot configuration fields
                                 let h_chunks = Layout::default()
                                     .direction(Direction::Horizontal)
-                                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                                    .constraints([
+                                        Constraint::Percentage(50),
+                                        Constraint::Percentage(50),
+                                    ])
                                     .split(last_chunks[2]);
-                                if mouse.column >= h_chunks[0].x && mouse.column < h_chunks[0].x + h_chunks[0].width {
+                                if mouse.column >= h_chunks[0].x
+                                    && mouse.column < h_chunks[0].x + h_chunks[0].width
+                                {
                                     let top = h_chunks[0].y + 1;
                                     if mouse.row == top + 1 {
                                         hotspot_selected_field = 0;
@@ -765,7 +869,9 @@ fn run_tui() -> Result<()> {
                                     } else if mouse.row == top + 3 {
                                         hotspot_selected_field = 1;
                                         is_editing_text = true;
-                                        status_msg = "Type new SSID. Press Enter to confirm, Esc to cancel.".to_string();
+                                        status_msg =
+                                            "Type new SSID. Press Enter to confirm, Esc to cancel."
+                                                .to_string();
                                     } else if mouse.row == top + 5 {
                                         hotspot_selected_field = 2;
                                         is_editing_text = true;
@@ -778,26 +884,42 @@ fn run_tui() -> Result<()> {
                             }
                         }
                         MouseEventKind::ScrollDown => {
-                            if mouse.row >= last_chunks[1].y && mouse.row < last_chunks[1].y + last_chunks[1].height {
+                            if mouse.row >= last_chunks[1].y
+                                && mouse.row < last_chunks[1].y + last_chunks[1].height
+                            {
                                 current_tab = (current_tab + 1) % tab_categories.len();
                                 is_editing_text = false;
-                                status_msg = format!("Switched to: {}", tab_categories[current_tab].title);
+                                status_msg =
+                                    format!("Switched to: {}", tab_categories[current_tab].title);
                             } else if current_tab == 0 {
                                 let i = match table_state.selected() {
-                                    Some(i) => if i + 1 < ifaces.len() { i + 1 } else { 0 },
-                                    None => 0,
+                                    Some(i) if i + 1 < ifaces.len() => i + 1,
+                                    _ => 0,
                                 };
                                 table_state.select(Some(i));
                             }
                         }
                         MouseEventKind::ScrollUp => {
-                            if mouse.row >= last_chunks[1].y && mouse.row < last_chunks[1].y + last_chunks[1].height {
-                                current_tab = if current_tab > 0 { current_tab - 1 } else { tab_categories.len() - 1 };
+                            if mouse.row >= last_chunks[1].y
+                                && mouse.row < last_chunks[1].y + last_chunks[1].height
+                            {
+                                current_tab = if current_tab > 0 {
+                                    current_tab - 1
+                                } else {
+                                    tab_categories.len() - 1
+                                };
                                 is_editing_text = false;
-                                status_msg = format!("Switched to: {}", tab_categories[current_tab].title);
+                                status_msg =
+                                    format!("Switched to: {}", tab_categories[current_tab].title);
                             } else if current_tab == 0 {
                                 let i = match table_state.selected() {
-                                    Some(i) => if i > 0 { i - 1 } else { ifaces.len().saturating_sub(1) },
+                                    Some(i) => {
+                                        if i > 0 {
+                                            i - 1
+                                        } else {
+                                            ifaces.len().saturating_sub(1)
+                                        }
+                                    }
                                     None => 0,
                                 };
                                 table_state.select(Some(i));
@@ -844,7 +966,11 @@ fn run_tui() -> Result<()> {
                             is_editing_text = false;
                         }
                         KeyCode::BackTab => {
-                            current_tab = if current_tab > 0 { current_tab - 1 } else { tab_categories.len() - 1 };
+                            current_tab = if current_tab > 0 {
+                                current_tab - 1
+                            } else {
+                                tab_categories.len() - 1
+                            };
                             is_editing_text = false;
                         }
                         KeyCode::Char('1') => {
@@ -874,70 +1000,120 @@ fn run_tui() -> Result<()> {
                         KeyCode::Up | KeyCode::Char('k') => {
                             if current_tab == 0 {
                                 let i = match table_state.selected() {
-                                    Some(i) => if i > 0 { i - 1 } else { ifaces.len().saturating_sub(1) },
+                                    Some(i) => {
+                                        if i > 0 {
+                                            i - 1
+                                        } else {
+                                            ifaces.len().saturating_sub(1)
+                                        }
+                                    }
                                     None => 0,
                                 };
                                 table_state.select(Some(i));
                             } else if current_tab == 3 {
-                                hotspot_selected_field = if hotspot_selected_field > 0 { hotspot_selected_field - 1 } else { 3 };
+                                hotspot_selected_field = if hotspot_selected_field > 0 {
+                                    hotspot_selected_field - 1
+                                } else {
+                                    3
+                                };
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             if current_tab == 0 {
                                 let i = match table_state.selected() {
-                                    Some(i) => if i < ifaces.len().saturating_sub(1) { i + 1 } else { 0 },
-                                    None => 0,
+                                    Some(i) if i < ifaces.len().saturating_sub(1) => i + 1,
+                                    _ => 0,
                                 };
                                 table_state.select(Some(i));
                             } else if current_tab == 3 {
-                                hotspot_selected_field = if hotspot_selected_field < 3 { hotspot_selected_field + 1 } else { 0 };
+                                hotspot_selected_field = if hotspot_selected_field < 3 {
+                                    hotspot_selected_field + 1
+                                } else {
+                                    0
+                                };
                             }
                         }
                         KeyCode::Left | KeyCode::Char('h') if current_tab == 3 => {
                             if hotspot_selected_field == 0 && !wifi_devs.is_empty() {
-                                selected_wifi_idx = if selected_wifi_idx > 0 { selected_wifi_idx - 1 } else { wifi_devs.len() - 1 };
+                                selected_wifi_idx = if selected_wifi_idx > 0 {
+                                    selected_wifi_idx - 1
+                                } else {
+                                    wifi_devs.len() - 1
+                                };
                             }
                         }
                         KeyCode::Right | KeyCode::Char('l') if current_tab == 3 => {
                             if hotspot_selected_field == 0 && !wifi_devs.is_empty() {
-                                selected_wifi_idx = if selected_wifi_idx + 1 < wifi_devs.len() { selected_wifi_idx + 1 } else { 0 };
+                                selected_wifi_idx = if selected_wifi_idx + 1 < wifi_devs.len() {
+                                    selected_wifi_idx + 1
+                                } else {
+                                    0
+                                };
                             }
                         }
                         KeyCode::Enter if current_tab == 3 => {
                             if hotspot_selected_field == 1 || hotspot_selected_field == 2 {
                                 is_editing_text = true;
-                                status_msg = "Type new value. Press Enter to confirm, Esc to cancel.".to_string();
+                                status_msg =
+                                    "Type new value. Press Enter to confirm, Esc to cancel."
+                                        .to_string();
                             } else if hotspot_selected_field == 3 {
-                                let cur_iface = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+                                let cur_iface =
+                                    wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
                                 if let Some(iface) = cur_iface {
                                     let (is_active, _, _) = is_hotspot_active(Some(iface));
                                     if is_active {
                                         match stop_hotspot(Some(iface)) {
-                                            Ok(msg) => { status_msg = msg; is_error = false; }
-                                            Err(e) => { status_msg = format!("Failed to stop: {}", e); is_error = true; }
+                                            Ok(msg) => {
+                                                status_msg = msg;
+                                                is_error = false;
+                                            }
+                                            Err(e) => {
+                                                status_msg = format!("Failed to stop: {}", e);
+                                                is_error = true;
+                                            }
                                         }
                                     } else {
                                         match start_hotspot(iface, &hotspot_ssid, &hotspot_pass) {
-                                            Ok(msg) => { status_msg = msg; is_error = false; }
-                                            Err(e) => { status_msg = format!("Failed to start: {}", e); is_error = true; }
+                                            Ok(msg) => {
+                                                status_msg = msg;
+                                                is_error = false;
+                                            }
+                                            Err(e) => {
+                                                status_msg = format!("Failed to start: {}", e);
+                                                is_error = true;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                         KeyCode::Char(' ') if current_tab == 3 => {
-                            let cur_iface = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+                            let cur_iface =
+                                wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
                             if let Some(iface) = cur_iface {
                                 let (is_active, _, _) = is_hotspot_active(Some(iface));
                                 if is_active {
                                     match stop_hotspot(Some(iface)) {
-                                        Ok(msg) => { status_msg = msg; is_error = false; }
-                                        Err(e) => { status_msg = format!("Failed to stop: {}", e); is_error = true; }
+                                        Ok(msg) => {
+                                            status_msg = msg;
+                                            is_error = false;
+                                        }
+                                        Err(e) => {
+                                            status_msg = format!("Failed to stop: {}", e);
+                                            is_error = true;
+                                        }
                                     }
                                 } else {
                                     match start_hotspot(iface, &hotspot_ssid, &hotspot_pass) {
-                                        Ok(msg) => { status_msg = msg; is_error = false; }
-                                        Err(e) => { status_msg = format!("Failed to start: {}", e); is_error = true; }
+                                        Ok(msg) => {
+                                            status_msg = msg;
+                                            is_error = false;
+                                        }
+                                        Err(e) => {
+                                            status_msg = format!("Failed to start: {}", e);
+                                            is_error = true;
+                                        }
                                     }
                                 }
                             }
@@ -955,8 +1131,14 @@ fn run_tui() -> Result<()> {
                             if let Some(idx) = table_state.selected() {
                                 if let Some(iface) = ifaces.get(idx) {
                                     match spoof_mac(&iface.name) {
-                                        Ok(msg) => { status_msg = msg; is_error = false; }
-                                        Err(e) => { status_msg = e.to_string(); is_error = true; }
+                                        Ok(msg) => {
+                                            status_msg = msg;
+                                            is_error = false;
+                                        }
+                                        Err(e) => {
+                                            status_msg = e.to_string();
+                                            is_error = true;
+                                        }
                                     }
                                     ifaces = fetch_interfaces();
                                 }
@@ -966,8 +1148,14 @@ fn run_tui() -> Result<()> {
                             if let Some(idx) = table_state.selected() {
                                 if let Some(iface) = ifaces.get(idx) {
                                     match restore_mac(&iface.name) {
-                                        Ok(msg) => { status_msg = msg; is_error = false; }
-                                        Err(e) => { status_msg = e.to_string(); is_error = true; }
+                                        Ok(msg) => {
+                                            status_msg = msg;
+                                            is_error = false;
+                                        }
+                                        Err(e) => {
+                                            status_msg = e.to_string();
+                                            is_error = true;
+                                        }
                                     }
                                     ifaces = fetch_interfaces();
                                 }
@@ -975,35 +1163,49 @@ fn run_tui() -> Result<()> {
                         }
                         KeyCode::Char('n') => {
                             disable_raw_mode()?;
-                            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                            execute!(
+                                terminal.backend_mut(),
+                                LeaveAlternateScreen,
+                                DisableMouseCapture
+                            )?;
                             let _ = Command::new("nmtui").status();
                             enable_raw_mode()?;
-                            execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+                            execute!(
+                                terminal.backend_mut(),
+                                EnterAlternateScreen,
+                                EnableMouseCapture
+                            )?;
                             terminal.clear()?;
                             ifaces = fetch_interfaces();
                             wifi_devs = fetch_wifi_devices();
                         }
-                        KeyCode::Char('s') => {
-                            match scan_subnet(None) {
-                                Ok(res) => {
-                                    scan_results = res;
-                                    current_tab = 1;
-                                    status_msg = "Subnet scan complete.".to_string();
-                                    is_error = false;
-                                }
-                                Err(e) => {
-                                    status_msg = format!("Scan failed: {}", e);
-                                    is_error = true;
-                                }
+                        KeyCode::Char('s') => match scan_subnet(None) {
+                            Ok(res) => {
+                                scan_results = res;
+                                current_tab = 1;
+                                status_msg = "Subnet scan complete.".to_string();
+                                is_error = false;
                             }
-                        }
+                            Err(e) => {
+                                status_msg = format!("Scan failed: {}", e);
+                                is_error = true;
+                            }
+                        },
                         KeyCode::Char('l') if current_tab == 2 => {
                             disable_raw_mode()?;
-                            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                            execute!(
+                                terminal.backend_mut(),
+                                LeaveAlternateScreen,
+                                DisableMouseCapture
+                            )?;
                             println!("Listening on port 9999 for incoming raw disk stream...");
                             let _ = Command::new("dfnet").args(["receive"]).status();
                             enable_raw_mode()?;
-                            execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+                            execute!(
+                                terminal.backend_mut(),
+                                EnterAlternateScreen,
+                                EnableMouseCapture
+                            )?;
                             terminal.clear()?;
                         }
                         _ => {}
@@ -1015,7 +1217,11 @@ fn run_tui() -> Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     Ok(())
 }
 
@@ -1038,7 +1244,10 @@ fn main() -> Result<()> {
         Some(Commands::Smb { remote, name, user }) => {
             let target = format!("/media/target/smb_{}", name);
             let _ = std::fs::create_dir_all(&target);
-            let user_arg = format!("username={},ro,noatime", user.unwrap_or_else(|| "guest".to_string()));
+            let user_arg = format!(
+                "username={},ro,noatime",
+                user.unwrap_or_else(|| "guest".to_string())
+            );
             let status = Command::new("mount.cifs")
                 .args([&remote, &target, "-o", &user_arg])
                 .status()?;
@@ -1079,43 +1288,52 @@ fn main() -> Result<()> {
             let _ = nc.wait();
             println!("[✓] Stream acquisition complete. Saved to {}", outfile);
         }
-        Some(Commands::Hotspot { action }) => {
-            match action.unwrap_or(HotspotAction::Status) {
-                HotspotAction::Start { iface, ssid, password } => {
-                    let dev = iface.or_else(|| fetch_wifi_devices().into_iter().next().map(|d| d.name));
-                    match dev {
-                        Some(i) => {
-                            let res = start_hotspot(&i, &ssid, &password)?;
-                            println!("[✓] {}", res);
-                        }
-                        None => {
-                            anyhow::bail!("No Wi-Fi adapter found on this system.");
-                        }
+        Some(Commands::Hotspot { action }) => match action.unwrap_or(HotspotAction::Status) {
+            HotspotAction::Start {
+                iface,
+                ssid,
+                password,
+            } => {
+                let dev = iface.or_else(|| fetch_wifi_devices().into_iter().next().map(|d| d.name));
+                match dev {
+                    Some(i) => {
+                        let res = start_hotspot(&i, &ssid, &password)?;
+                        println!("[✓] {}", res);
                     }
-                }
-                HotspotAction::Stop { iface } => {
-                    let res = stop_hotspot(iface.as_deref())?;
-                    println!("[✓] {}", res);
-                }
-                HotspotAction::Status => {
-                    let devs = fetch_wifi_devices();
-                    if devs.is_empty() {
-                        println!("[-] No Wi-Fi hardware interfaces detected.");
-                    } else {
-                        println!("[*] Detected Wi-Fi interfaces:");
-                        for d in &devs {
-                            let (active, ip, ssid) = is_hotspot_active(Some(&d.name));
-                            let state_str = if active {
-                                format!("ACTIVE (SSID: {}, IP: {})", ssid.unwrap_or_default(), ip.unwrap_or_default())
-                            } else {
-                                "INACTIVE".to_string()
-                            };
-                            println!("    - {} (State: {}, Hotspot: {})", d.name, d.state, state_str);
-                        }
+                    None => {
+                        anyhow::bail!("No Wi-Fi adapter found on this system.");
                     }
                 }
             }
-        }
+            HotspotAction::Stop { iface } => {
+                let res = stop_hotspot(iface.as_deref())?;
+                println!("[✓] {}", res);
+            }
+            HotspotAction::Status => {
+                let devs = fetch_wifi_devices();
+                if devs.is_empty() {
+                    println!("[-] No Wi-Fi hardware interfaces detected.");
+                } else {
+                    println!("[*] Detected Wi-Fi interfaces:");
+                    for d in &devs {
+                        let (active, ip, ssid) = is_hotspot_active(Some(&d.name));
+                        let state_str = if active {
+                            format!(
+                                "ACTIVE (SSID: {}, IP: {})",
+                                ssid.unwrap_or_default(),
+                                ip.unwrap_or_default()
+                            )
+                        } else {
+                            "INACTIVE".to_string()
+                        };
+                        println!(
+                            "    - {} (State: {}, Hotspot: {})",
+                            d.name, d.state, state_str
+                        );
+                    }
+                }
+            }
+        },
         None => {
             run_tui()?;
         }
