@@ -128,6 +128,81 @@ cmd_receive_raw_disk() {
     echo -e "    Hash Manifest: ${outfile}.sha256"
 }
 
+cmd_route_status() {
+    local iface="${1:-}"
+    echo -e "${BOLD}[*] Network Routing & Forensic Isolation Status:${NC}"
+    local fwd
+    fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
+    if [[ "$fwd" == "1" ]]; then
+        echo -e "  IP Forwarding:   ${GREEN}${BOLD}Enabled (net.ipv4.ip_forward=1)${NC}"
+    else
+        echo -e "  IP Forwarding:   ${YELLOW}Disabled (net.ipv4.ip_forward=0)${NC}"
+    fi
+
+    local def_gw
+    def_gw=$(ip route show default 2>/dev/null | head -n1 || true)
+    echo -e "  Default Route:   ${CYAN}${def_gw:-None}${NC}"
+
+    echo -e "  Active iptables Forward Rules:"
+    iptables -S FORWARD 2>/dev/null | while read -r line; do
+        echo -e "    $line"
+    done || echo -e "    (Unable to read iptables rules)"
+
+    echo -e "  Active NAT Masquerade Rules:"
+    iptables -t nat -S POSTROUTING 2>/dev/null | grep MASQUERADE | while read -r line; do
+        echo -e "    $line"
+    done || echo -e "    (None or permission denied)"
+}
+
+cmd_route_enable() {
+    local ap="${1:-}"
+    local uplink="${2:-}"
+    if [[ -z "$ap" || -z "$uplink" ]]; then
+        echo "Usage: df-net route enable <ap_iface> <uplink_iface>"
+        exit 1
+    fi
+
+    echo -e "${CYAN}[*] Enabling NAT Passthrough: $ap -> $uplink...${NC}"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    iptables -t nat -A POSTROUTING -o "$uplink" -j MASQUERADE
+    iptables -A FORWARD -i "$ap" -o "$uplink" -j ACCEPT
+    iptables -A FORWARD -i "$uplink" -o "$ap" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$uplink" -o "$ap" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    echo -e "${GREEN}[✓] NAT Passthrough enabled via $uplink.${NC}"
+}
+
+cmd_route_isolate() {
+    local ap="${1:-}"
+    if [[ -z "$ap" ]]; then
+        echo "Usage: df-net route isolate <ap_iface>"
+        exit 1
+    fi
+
+    echo -e "${CYAN}[*] Isolating AP $ap (Strict Forensic Air-Gap)...${NC}"
+    sysctl -w net.ipv4.ip_forward=0 >/dev/null
+    iptables -I FORWARD 1 -i "$ap" -j DROP
+    iptables -I FORWARD 1 -o "$ap" -j DROP
+    echo -e "${GREEN}[✓] Forensic Air-Gap active on $ap. Forwarding to LAN/Internet blocked.${NC}"
+}
+
+cmd_route_reset() {
+    local ap="${1:-}"
+    local uplink="${2:-}"
+    echo -e "${CYAN}[*] Resetting and flushing routing & forward rules...${NC}"
+    if [[ -n "$ap" ]]; then
+        iptables -D FORWARD -i "$ap" -j DROP 2>/dev/null || true
+        iptables -D FORWARD -o "$ap" -j DROP 2>/dev/null || true
+        if [[ -n "$uplink" ]]; then
+            iptables -D FORWARD -i "$ap" -o "$uplink" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$uplink" -o "$ap" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$uplink" -o "$ap" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+            iptables -t nat -D POSTROUTING -o "$uplink" -j MASQUERADE 2>/dev/null || true
+        fi
+    fi
+    sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+    echo -e "${GREEN}[✓] Routing rules flushed and forwarding reset.${NC}"
+}
+
 cmd_wifi_hotspot_status() {
     echo -e "${BOLD}[*] Wi-Fi Hotspot Status:${NC}"
     local active_con
@@ -140,7 +215,32 @@ cmd_wifi_hotspot_status() {
         echo -e "  Status:     ${GREEN}${BOLD}ACTIVE (Broadcasting)${NC}"
         echo -e "  Interface:  ${CYAN}${dev}${NC}"
         echo -e "  Gateway IP: ${GREEN}${ip}${NC}"
-        echo -e "  Security:   WPA2-Personal (Shared NAT)"
+        echo -e "  Security:   WPA2-Personal • 802.11 AP"
+
+        local fwd
+        fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "0")
+        if [[ "$fwd" == "1" ]]; then
+            echo -e "  IP Forward: ${GREEN}Enabled (1)${NC}"
+        else
+            echo -e "  IP Forward: ${YELLOW}Disabled (0)${NC}"
+        fi
+
+        local drop_rule
+        drop_rule=$(iptables -S FORWARD 2>/dev/null | grep -- "-i $dev -j DROP" || true)
+        if [[ -n "$drop_rule" ]]; then
+            echo -e "  Firewall:   ${MAGENTA}${BOLD}Air-Gapped / Isolated (Strict DROP)${NC}"
+        else
+            local fwd_rule
+            fwd_rule=$(iptables -S FORWARD 2>/dev/null | grep -- "-i $dev -o " | head -n1 || true)
+            if [[ -n "$fwd_rule" ]]; then
+                local up
+                up=$(echo "$fwd_rule" | awk '{for(i=1;i<=NF;i++) if($i=="-o") print $(i+1)}')
+                echo -e "  Firewall:   ${GREEN}${BOLD}Routed to LAN via ${up} (NAT Masquerade)${NC}"
+            else
+                echo -e "  Firewall:   Standby / Unmanaged"
+            fi
+        fi
+
         echo ""
         echo -e "${BOLD}[*] Associated / Connected Clients:${NC}"
         ip neigh show dev "$dev" 2>/dev/null || echo "  (No clients detected)"
@@ -160,16 +260,53 @@ cmd_wifi_hotspot_status() {
 }
 
 cmd_wifi_hotspot_stop() {
+    local dev="${1:-}"
+    if [[ -z "$dev" ]]; then
+        dev=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep '^dfnet-hotspot:' | cut -d: -f2 || true)
+    fi
+
     echo -e "${CYAN}[*] Stopping Wi-Fi hotspot...${NC}"
     nmcli connection down id dfnet-hotspot 2>/dev/null || true
     nmcli connection delete id dfnet-hotspot 2>/dev/null || true
-    echo -e "${GREEN}[✓] Wi-Fi hotspot stopped and profile cleared.${NC}"
+
+    if [[ -n "$dev" ]]; then
+        cmd_route_reset "$dev" ""
+    fi
+    echo -e "${GREEN}[✓] Wi-Fi hotspot stopped, routing flushed, and profile cleared.${NC}"
 }
 
 cmd_wifi_hotspot_start() {
-    local iface="${1:-}"
-    local ssid="${2:-DF-FORENSICS-AP}"
-    local pass="${3:-Forensics2026!}"
+    local iface=""
+    local ssid="DF-FORENSICS-AP"
+    local pass="Forensics2026!"
+    local uplink=""
+    local isolate="false"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --uplink)
+                uplink="$2"
+                shift 2
+                ;;
+            --isolate)
+                isolate="true"
+                shift
+                ;;
+            -*)
+                shift
+                ;;
+            *)
+                if [[ -z "$iface" ]]; then
+                    iface="$1"
+                elif [[ "$ssid" == "DF-FORENSICS-AP" ]]; then
+                    ssid="$1"
+                elif [[ "$pass" == "Forensics2026!" ]]; then
+                    pass="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     if [[ -z "$iface" ]]; then
         iface=$(nmcli -t -f DEVICE,TYPE dev 2>/dev/null | grep ':wifi$' | cut -d: -f1 | head -n1 || true)
@@ -208,7 +345,20 @@ cmd_wifi_hotspot_start() {
         local ip
         ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2}' || echo "10.42.0.1/24")
         echo -e "    Hotspot IP:        ${GREEN}$ip${NC}"
-        echo -e "    Target systems can join and stream forensic data directly."
+
+        if [[ "$isolate" == "true" ]]; then
+            cmd_route_isolate "$iface"
+        elif [[ -n "$uplink" ]]; then
+            cmd_route_enable "$iface" "$uplink"
+        else
+            local def_up
+            def_up=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1 || true)
+            if [[ -n "$def_up" && "$def_up" != "$iface" ]]; then
+                cmd_route_enable "$iface" "$def_up"
+            else
+                cmd_route_isolate "$iface"
+            fi
+        fi
     else
         echo -e "${RED}[!] Failed to bring up Wi-Fi hotspot on $iface.${NC}" >&2
         exit 1
@@ -218,14 +368,15 @@ cmd_wifi_hotspot_start() {
 usage() {
     echo -e "${BOLD}df-net${NC} — Forensic Network Operations Helper"
     echo "Usage:"
-    echo "  df-net ip                              Launch NetworkManager TUI (nmtui) to configure static IP / Wi-Fi"
-    echo "  df-net mac [iface]                     Spoof/randomize MAC address for stealth connection"
-    echo "  df-net mac-restore [iface]             Restore original factory hardware MAC address"
-    echo "  df-net scan [iface]                    Quick ARP network discovery of local servers/NAS"
-    echo "  df-net smb <//srv/sh> <dir>            Mount an on-premise Windows/Samba share to /media/target"
-    echo "  df-net nfs <srv:/exp> <dir>            Mount an on-premise NFS export to /media/target"
-    echo "  df-net receive [port] [out]            Listen on network port to receive raw disk stream over netcat"
-    echo "  df-net hotspot [start|stop|status] ... Manage Wi-Fi hotspot / forensic access point"
+    echo "  df-net ip                                      Launch NetworkManager TUI (nmtui) to configure static IP / Wi-Fi"
+    echo "  df-net mac [iface]                             Spoof/randomize MAC address for stealth connection"
+    echo "  df-net mac-restore [iface]                     Restore original factory hardware MAC address"
+    echo "  df-net scan [iface]                            Quick ARP network discovery of local servers/NAS"
+    echo "  df-net smb <//srv/sh> <dir>                    Mount an on-premise Windows/Samba share to /media/target"
+    echo "  df-net nfs <srv:/exp> <dir>                    Mount an on-premise NFS export to /media/target"
+    echo "  df-net receive [port] [out]                    Listen on network port to receive raw disk stream over netcat"
+    echo "  df-net hotspot [start|stop|status] ...         Manage Wi-Fi hotspot / forensic access point"
+    echo "  df-net route [status|enable|isolate|reset] ... Manage NAT passthrough routing and forensic air-gap"
     exit 1
 }
 
@@ -262,13 +413,41 @@ case "${1:-}" in
                 cmd_wifi_hotspot_start "$@"
                 ;;
             stop)
-                cmd_wifi_hotspot_stop
+                shift
+                cmd_wifi_hotspot_stop "${1:-}"
                 ;;
             status)
                 cmd_wifi_hotspot_status
                 ;;
             *)
-                echo "Usage: df-net hotspot [start|stop|status] [iface] [ssid] [password]"
+                echo "Usage: df-net hotspot start [iface] [ssid] [pass] [--uplink <dev>] [--isolate]"
+                echo "       df-net hotspot stop [iface]"
+                echo "       df-net hotspot status"
+                exit 1
+                ;;
+        esac
+        ;;
+    route)
+        shift
+        case "${1:-status}" in
+            status)
+                shift
+                cmd_route_status "$@"
+                ;;
+            enable)
+                shift
+                cmd_route_enable "$@"
+                ;;
+            isolate)
+                shift
+                cmd_route_isolate "$@"
+                ;;
+            reset)
+                shift
+                cmd_route_reset "$@"
+                ;;
+            *)
+                echo "Usage: df-net route [status|enable|isolate|reset] ..."
                 exit 1
                 ;;
         esac
@@ -277,3 +456,4 @@ case "${1:-}" in
         usage
         ;;
 esac
+

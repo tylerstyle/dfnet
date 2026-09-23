@@ -10,6 +10,7 @@
 , pv
 , iproute2
 , util-linux
+, iptables
 }:
 
 rustPlatform.buildRustPackage {
@@ -43,6 +44,7 @@ rustPlatform.buildRustPackage {
         pv
         iproute2
         util-linux
+        iptables
       ]}
 
     wrapProgram $out/bin/dfnet-cli \
@@ -56,6 +58,7 @@ rustPlatform.buildRustPackage {
         pv
         iproute2
         util-linux
+        iptables
       ]}
 
     # Desktop entry
