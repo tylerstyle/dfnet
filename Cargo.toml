@@ -1,6 +1,6 @@
 [package]
 name = "dfnet"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Modern forensic network triage, stealth MAC cloaking, share ingestion & disk stream receiver TUI"
