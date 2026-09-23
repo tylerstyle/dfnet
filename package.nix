@@ -11,11 +11,12 @@
 , iproute2
 , util-linux
 , iptables
+, procps
 }:
 
 rustPlatform.buildRustPackage {
   pname = "dfnet";
-  version = "0.1.1";
+  version = "0.1.2";
 
   src = lib.cleanSource ./.;
 
@@ -45,6 +46,7 @@ rustPlatform.buildRustPackage {
         iproute2
         util-linux
         iptables
+        procps
       ]}
 
     wrapProgram $out/bin/dfnet-cli \
@@ -59,6 +61,7 @@ rustPlatform.buildRustPackage {
         iproute2
         util-linux
         iptables
+        procps
       ]}
 
     # Desktop entry

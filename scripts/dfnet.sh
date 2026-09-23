@@ -164,10 +164,12 @@ cmd_route_enable() {
 
     echo -e "${CYAN}[*] Enabling NAT Passthrough: $ap -> $uplink...${NC}"
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sysctl -w "net.ipv4.conf.${ap}.rp_filter=2" >/dev/null 2>&1 || true
+    iptables -I INPUT 1 -i "$ap" -j ACCEPT 2>/dev/null || true
     iptables -t nat -A POSTROUTING -o "$uplink" -j MASQUERADE
     iptables -A FORWARD -i "$ap" -o "$uplink" -j ACCEPT
-    iptables -A FORWARD -i "$uplink" -o "$ap" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -i "$uplink" -o "$ap" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -A FORWARD -i "$uplink" -o "$ap" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$uplink" -o "$ap" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     echo -e "${GREEN}[✓] NAT Passthrough enabled via $uplink.${NC}"
 }
 
@@ -180,6 +182,8 @@ cmd_route_isolate() {
 
     echo -e "${CYAN}[*] Isolating AP $ap (Strict Forensic Air-Gap)...${NC}"
     sysctl -w net.ipv4.ip_forward=0 >/dev/null
+    sysctl -w "net.ipv4.conf.${ap}.rp_filter=2" >/dev/null 2>&1 || true
+    iptables -I INPUT 1 -i "$ap" -j ACCEPT 2>/dev/null || true
     iptables -I FORWARD 1 -i "$ap" -j DROP
     iptables -I FORWARD 1 -o "$ap" -j DROP
     echo -e "${GREEN}[✓] Forensic Air-Gap active on $ap. Forwarding to LAN/Internet blocked.${NC}"
@@ -190,12 +194,13 @@ cmd_route_reset() {
     local uplink="${2:-}"
     echo -e "${CYAN}[*] Resetting and flushing routing & forward rules...${NC}"
     if [[ -n "$ap" ]]; then
+        iptables -D INPUT -i "$ap" -j ACCEPT 2>/dev/null || true
         iptables -D FORWARD -i "$ap" -j DROP 2>/dev/null || true
         iptables -D FORWARD -o "$ap" -j DROP 2>/dev/null || true
         if [[ -n "$uplink" ]]; then
             iptables -D FORWARD -i "$ap" -o "$uplink" -j ACCEPT 2>/dev/null || true
-            iptables -D FORWARD -i "$uplink" -o "$ap" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
             iptables -D FORWARD -i "$uplink" -o "$ap" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$uplink" -o "$ap" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
             iptables -t nat -D POSTROUTING -o "$uplink" -j MASQUERADE 2>/dev/null || true
         fi
     fi
