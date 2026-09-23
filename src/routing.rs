@@ -195,7 +195,17 @@ pub fn enable_nat_routing(ap_iface: &str, uplink: &str) -> Result<()> {
     // 2. Enable IPv4 forwarding
     set_ip_forwarding(true).context("Failed to enable net.ipv4.ip_forward=1")?;
 
-    // 3. Masquerade on uplink
+    // 3. Set loose reverse path filtering so DHCP broadcast traffic is never dropped
+    let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", ap_iface), "2\n");
+    let _ = Command::new("sysctl")
+        .args(["-w", &format!("net.ipv4.conf.{}.rp_filter=2", ap_iface)])
+        .output();
+
+    // 4. Allow DHCP (port 67), DNS (port 53), and local ingest services on AP interface
+    iptables_insert_unique(None, "INPUT", 1, &["-i", ap_iface, "-j", "ACCEPT"])
+        .context("Failed to insert iptables INPUT rule for ap_iface")?;
+
+    // 5. Masquerade on uplink
     iptables_append_unique(
         Some("nat"),
         "POSTROUTING",
@@ -203,7 +213,7 @@ pub fn enable_nat_routing(ap_iface: &str, uplink: &str) -> Result<()> {
     )
     .context("Failed to configure iptables NAT Masquerade on uplink")?;
 
-    // 4. FORWARD rule from ap_iface to uplink
+    // 6. FORWARD rule from ap_iface to uplink
     iptables_append_unique(
         None,
         "FORWARD",
@@ -211,7 +221,7 @@ pub fn enable_nat_routing(ap_iface: &str, uplink: &str) -> Result<()> {
     )
     .context("Failed to configure iptables FORWARD out rule")?;
 
-    // 5. FORWARD return rule from uplink to ap_iface for established / related traffic
+    // 7. FORWARD return rule from uplink to ap_iface for established / related traffic
     let conntrack_rule = [
         "-i",
         uplink,
@@ -264,11 +274,21 @@ pub fn enable_isolated_routing(ap_iface: &str) -> Result<()> {
     // 2. Disable global IP forwarding
     let _ = set_ip_forwarding(false);
 
-    // 3. Strict DROP on forward traffic originating from ap_iface
+    // 3. Set loose reverse path filtering so DHCP broadcast traffic is never dropped
+    let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", ap_iface), "2\n");
+    let _ = Command::new("sysctl")
+        .args(["-w", &format!("net.ipv4.conf.{}.rp_filter=2", ap_iface)])
+        .output();
+
+    // 4. Allow DHCP, DNS, and local triage/ingest services from connected AP clients
+    iptables_insert_unique(None, "INPUT", 1, &["-i", ap_iface, "-j", "ACCEPT"])
+        .context("Failed to insert iptables INPUT rule for ap_iface")?;
+
+    // 5. Strict DROP on forward traffic originating from ap_iface
     iptables_insert_unique(None, "FORWARD", 1, &["-i", ap_iface, "-j", "DROP"])
         .context("Failed to insert iptables DROP rule for ap_iface outbound")?;
 
-    // 4. Also block forward traffic destined to ap_iface from external networks
+    // 6. Also block forward traffic destined to ap_iface from external networks
     iptables_insert_unique(None, "FORWARD", 1, &["-o", ap_iface, "-j", "DROP"])
         .context("Failed to insert iptables DROP rule for ap_iface inbound")?;
 
@@ -277,8 +297,9 @@ pub fn enable_isolated_routing(ap_iface: &str) -> Result<()> {
 
 /// Flushes all forwarding and NAT rules associated with ap_iface and uplink, restoring forward state
 pub fn teardown_routing(ap_iface: &str, uplink: Option<&str>) -> Result<()> {
-    // 1. Remove DROP rules for ap_iface
+    // 1. Remove INPUT and DROP rules for ap_iface
     if !ap_iface.is_empty() {
+        iptables_delete_all(None, "INPUT", &["-i", ap_iface, "-j", "ACCEPT"]);
         iptables_delete_all(None, "FORWARD", &["-i", ap_iface, "-j", "DROP"]);
         iptables_delete_all(None, "FORWARD", &["-o", ap_iface, "-j", "DROP"]);
     }
@@ -323,30 +344,32 @@ pub fn teardown_routing(ap_iface: &str, uplink: Option<&str>) -> Result<()> {
         iptables_delete_all(Some("nat"), "POSTROUTING", &["-o", up, "-j", "MASQUERADE"]);
     }
 
-    // 3. Parse iptables -S FORWARD to catch any remaining rules matching ap_iface
+    // 3. Parse iptables -S to catch any remaining rules matching ap_iface in FORWARD and INPUT
     if !ap_iface.is_empty() {
-        let (success, _) = iptables_exec(&["-S", "FORWARD"]);
-        if success {
-            if let Ok(out) = Command::new("iptables").args(["-S", "FORWARD"]).output() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                for line in text.lines() {
-                    if line.contains(ap_iface) && line.starts_with("-A FORWARD") {
-                        let rule_args: Vec<&str> = line.split_whitespace().collect();
-                        if rule_args.len() >= 3 {
-                            let mut del_cmd = vec!["-D", "FORWARD"];
-                            del_cmd.extend_from_slice(&rule_args[2..]);
-                            let _ = iptables_exec(&del_cmd);
-                        }
-                        // Also check if line specified an uplink interface
-                        for (idx, &part) in rule_args.iter().enumerate() {
-                            if (part == "-o" || part == "-i") && idx + 1 < rule_args.len() {
-                                let candidate = rule_args[idx + 1];
-                                if candidate != ap_iface && !candidate.is_empty() {
-                                    iptables_delete_all(
-                                        Some("nat"),
-                                        "POSTROUTING",
-                                        &["-o", candidate, "-j", "MASQUERADE"],
-                                    );
+        for chain in ["FORWARD", "INPUT"] {
+            let (success, _) = iptables_exec(&["-S", chain]);
+            if success {
+                if let Ok(out) = Command::new("iptables").args(["-S", chain]).output() {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    for line in text.lines() {
+                        if line.contains(ap_iface) && line.starts_with(&format!("-A {}", chain)) {
+                            let rule_args: Vec<&str> = line.split_whitespace().collect();
+                            if rule_args.len() >= 3 {
+                                let mut del_cmd = vec!["-D", chain];
+                                del_cmd.extend_from_slice(&rule_args[2..]);
+                                let _ = iptables_exec(&del_cmd);
+                            }
+                            // Also check if line specified an uplink interface
+                            for (idx, &part) in rule_args.iter().enumerate() {
+                                if (part == "-o" || part == "-i") && idx + 1 < rule_args.len() {
+                                    let candidate = rule_args[idx + 1];
+                                    if candidate != ap_iface && !candidate.is_empty() {
+                                        iptables_delete_all(
+                                            Some("nat"),
+                                            "POSTROUTING",
+                                            &["-o", candidate, "-j", "MASQUERADE"],
+                                        );
+                                    }
                                 }
                             }
                         }
