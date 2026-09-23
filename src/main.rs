@@ -291,9 +291,24 @@ fn start_hotspot(iface: &str, ssid: &str, password: &str) -> Result<String> {
     if password.len() < 8 {
         anyhow::bail!("Wi-Fi WPA2 password must be at least 8 characters long.");
     }
+
+    // Ensure wifi hardware and radio are unblocked and enabled
+    let _ = Command::new("rfkill").args(["unblock", "wifi"]).output();
+    let _ = Command::new("nmcli").args(["radio", "wifi", "on"]).output();
+
+    // Disconnect if currently connected as a client on this device to avoid conflict
+    let _ = Command::new("nmcli")
+        .args(["device", "disconnect", iface])
+        .output();
+
+    // Clean up any lingering dfnet-hotspot connection profile
+    let _ = Command::new("nmcli")
+        .args(["connection", "down", "id", "dfnet-hotspot"])
+        .output();
     let _ = Command::new("nmcli")
         .args(["connection", "delete", "id", "dfnet-hotspot"])
         .output();
+
     let output = Command::new("nmcli")
         .args([
             "device",
@@ -339,7 +354,7 @@ fn is_hotspot_active(iface: Option<&str>) -> (bool, Option<String>, Option<Strin
         .args([
             "-t",
             "-f",
-            "NAME,TYPE,DEVICE",
+            "NAME,UUID,TYPE,DEVICE",
             "connection",
             "show",
             "--active",
@@ -349,11 +364,26 @@ fn is_hotspot_active(iface: Option<&str>) -> (bool, Option<String>, Option<Strin
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines() {
             let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() >= 3 && (parts[1] == "802-11-wireless" || parts[1] == "wifi") {
-                let dev_name = parts[2];
+            if parts.len() >= 4 && (parts[2] == "802-11-wireless" || parts[2] == "wifi") {
+                let dev_name = parts[3];
+                let con_name = parts[0];
+                let con_uuid = parts[1];
                 if iface.is_none_or(|i| i == dev_name) {
-                    let ip = get_interface_ip(dev_name);
-                    return (true, ip, Some(parts[0].to_string()));
+                    // Check if this active wireless connection is actually in AP / hotspot mode
+                    let is_ap = if con_name == "dfnet-hotspot" {
+                        true
+                    } else if let Ok(mode_out) = Command::new("nmcli")
+                        .args(["-g", "802-11-wireless.mode", "connection", "show", con_uuid])
+                        .output()
+                    {
+                        String::from_utf8_lossy(&mode_out.stdout).trim() == "ap"
+                    } else {
+                        false
+                    };
+                    if is_ap {
+                        let ip = get_interface_ip(dev_name);
+                        return (true, ip, Some(con_name.to_string()));
+                    }
                 }
             }
         }
@@ -446,25 +476,55 @@ fn start_hotspot_with_routing(
     mode: HotspotRoutingMode,
     uplink: Option<&str>,
 ) -> Result<String> {
-    let base_msg = start_hotspot(iface, ssid, password)?;
-
-    match mode {
+    // 1. Validate routing prerequisite BEFORE touching network state
+    let resolved_uplink = match mode {
         HotspotRoutingMode::NatPassthrough => {
             let up = uplink
                 .map(|s| s.to_string())
-                .or_else(get_default_gateway_interface)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("No active uplink interface available for NAT passthrough.")
-                })?;
-            enable_nat_routing(iface, &up)?;
-            Ok(format!("{} | NAT Passthrough enabled via {}", base_msg, up))
+                .or_else(get_default_gateway_interface);
+            match up {
+                Some(u) => {
+                    if u == iface {
+                        anyhow::bail!(
+                            "Cannot route traffic to the same interface ({}). Select a separate LAN/Ethernet uplink.",
+                            iface
+                        );
+                    }
+                    Some(u)
+                }
+                None => {
+                    anyhow::bail!(
+                        "Cannot start in NAT Passthrough mode: No active uplink LAN interface found. Select 'Air-Gapped / Isolated' mode or connect an Ethernet cable."
+                    );
+                }
+            }
+        }
+        HotspotRoutingMode::Isolated => None,
+    };
+
+    // 2. Start physical AP via NetworkManager
+    let base_msg = start_hotspot(iface, ssid, password)?;
+
+    // 3. Apply routing policy
+    let routing_result = match mode {
+        HotspotRoutingMode::NatPassthrough => {
+            let up = resolved_uplink.as_ref().unwrap();
+            enable_nat_routing(iface, up)
+                .map(|_| format!("{} | NAT Passthrough enabled via {}", base_msg, up))
         }
         HotspotRoutingMode::Isolated => {
-            enable_isolated_routing(iface)?;
-            Ok(format!(
-                "{} | Air-Gapped / Isolated (LAN/WAN forwarding blocked)",
-                base_msg
-            ))
+            enable_isolated_routing(iface)
+                .map(|_| format!("{} | Air-Gapped / Isolated (LAN/WAN forwarding blocked)", base_msg))
+        }
+    };
+
+    // 4. Rollback hotspot if routing failed to avoid half-configured state
+    match routing_result {
+        Ok(msg) => Ok(msg),
+        Err(e) => {
+            let _ = stop_hotspot(Some(iface));
+            let _ = teardown_routing(iface, resolved_uplink.as_deref());
+            Err(e)
         }
     }
 }
@@ -1010,15 +1070,26 @@ fn run_tui() -> Result<()> {
 
             // 4. Status Box
             let status_color = if is_error { Color::Red } else { Color::Green };
+            let clean_status = status_msg.replace('\n', " ");
             let status_p = Paragraph::new(Line::from(vec![
-                Span::styled(" >> ", Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-                Span::styled(&status_msg, Style::default().fg(status_color)),
+                Span::styled(
+                    if is_error { " ✖ " } else { " >> " },
+                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    &clean_status,
+                    Style::default().fg(status_color).add_modifier(if is_error { Modifier::BOLD } else { Modifier::empty() }),
+                ),
             ]))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .title(Span::styled(
+                        if is_error { " Alert / Error " } else { " Status " },
+                        Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                    ))
+                    .border_style(Style::default().fg(if is_error { Color::Red } else { Color::DarkGray })),
             );
             f.render_widget(status_p, chunks[3]);
 
@@ -1168,6 +1239,7 @@ fn run_tui() -> Result<()> {
                                                     Err(e) => { status_msg = format!("Failed to start: {}", e); is_error = true; }
                                                 }
                                             }
+                                            let _ = terminal.clear();
                                         }
                                     }
                                 }
@@ -1417,17 +1489,26 @@ fn run_tui() -> Result<()> {
                                             }
                                         }
                                     }
+                                    let _ = terminal.clear();
                                 }
                             }
                         }
                         KeyCode::Char(' ') if current_tab == 3 => {
-                            if hotspot_selected_field == 3 {
+                            if hotspot_selected_field == 0 && !wifi_devs.is_empty() {
+                                selected_wifi_idx = (selected_wifi_idx + 1) % wifi_devs.len();
+                                let cur_wifi_name = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+                                uplink_ifaces = fetch_uplink_interfaces(cur_wifi_name, &wifi_names);
+                                status_msg = format!("Selected Wi-Fi adapter: {}", wifi_devs[selected_wifi_idx].name);
+                            } else if hotspot_selected_field == 1 || hotspot_selected_field == 2 {
+                                is_editing_text = true;
+                                status_msg = "Type new value. Press Enter to confirm, Esc to cancel.".to_string();
+                            } else if hotspot_selected_field == 3 {
                                 routing_mode = routing_mode.toggle();
                                 status_msg = format!("Routing mode set to: {}", routing_mode.label());
                             } else if hotspot_selected_field == 4 && routing_mode == HotspotRoutingMode::NatPassthrough && !uplink_ifaces.is_empty() {
                                 selected_uplink_idx = (selected_uplink_idx + 1) % uplink_ifaces.len();
                                 status_msg = format!("Selected uplink adapter: {}", uplink_ifaces[selected_uplink_idx].name);
-                            } else {
+                            } else if hotspot_selected_field == 5 {
                                 let cur_iface =
                                     wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
                                 if let Some(iface) = cur_iface {
@@ -1461,6 +1542,7 @@ fn run_tui() -> Result<()> {
                                             }
                                         }
                                     }
+                                    let _ = terminal.clear();
                                 }
                             }
                         }
@@ -1498,6 +1580,7 @@ fn run_tui() -> Result<()> {
                                         }
                                     }
                                 }
+                                let _ = terminal.clear();
                             }
                         }
                         KeyCode::Char('r') => {
