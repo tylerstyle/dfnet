@@ -15,7 +15,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "dfnet";
-  version = "0.1.0";
+  version = "0.1.1";
 
   src = lib.cleanSource ./.;
 
