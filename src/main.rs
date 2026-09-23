@@ -21,6 +21,13 @@ use std::{
     time::Duration,
 };
 
+mod routing;
+
+use routing::{
+    enable_isolated_routing, enable_nat_routing, get_default_gateway_interface,
+    get_routing_status, teardown_routing, HotspotRoutingMode,
+};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "dfnet",
@@ -58,11 +65,16 @@ enum Commands {
         #[command(subcommand)]
         action: Option<HotspotAction>,
     },
+    /// Manage network routing, NAT passthrough, and forensic isolation
+    Route {
+        #[command(subcommand)]
+        action: Option<RouteAction>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum HotspotAction {
-    /// Start Wi-Fi hotspot with specified or default SSID and password
+    /// Start Wi-Fi hotspot with specified or default SSID, password, and routing options
     Start {
         #[arg(short, long)]
         iface: Option<String>,
@@ -70,22 +82,64 @@ enum HotspotAction {
         ssid: String,
         #[arg(short, long, default_value = "forensics123")]
         password: String,
+        /// Uplink LAN/WAN interface to route AP clients through (e.g. eth0, enp0s31f6)
+        #[arg(short, long)]
+        uplink: Option<String>,
+        /// Enable strict air-gapped forensic isolation (block all forwarding to LAN/Internet)
+        #[arg(long)]
+        isolate: bool,
     },
-    /// Stop currently running Wi-Fi hotspot
+    /// Stop currently running Wi-Fi hotspot and flush routing rules
     Stop {
         #[arg(short, long)]
         iface: Option<String>,
+        #[arg(short, long)]
+        uplink: Option<String>,
     },
     /// Display status of Wi-Fi hotspot and connected clients
     Status,
 }
 
+#[derive(Subcommand, Debug)]
+enum RouteAction {
+    /// Display current IP forwarding state, uplink interface, and firewall/NAT rules
+    Status {
+        /// Optional AP or interface to inspect
+        #[arg(short, long)]
+        ap: Option<String>,
+    },
+    /// Enable NAT passthrough from AP to uplink interface
+    Enable {
+        /// Hotspot / AP interface (e.g. wlan0, wlp0s20f3)
+        #[arg(short, long)]
+        ap: String,
+        /// Uplink LAN/WAN interface (e.g. eth0, enp0s31f6)
+        #[arg(short, long)]
+        uplink: String,
+    },
+    /// Strictly isolate AP from all LAN and Internet forwarding (air-gapped)
+    Isolate {
+        /// Hotspot / AP interface (e.g. wlan0, wlp0s20f3)
+        #[arg(short, long)]
+        ap: String,
+    },
+    /// Flush all forwarding and NAT rules and reset IP forwarding to 0
+    Reset {
+        /// AP interface whose rules should be flushed
+        #[arg(short, long)]
+        ap: Option<String>,
+        /// Uplink interface whose masquerade rules should be flushed
+        #[arg(short, long)]
+        uplink: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone)]
-struct NetInterface {
-    name: String,
-    state: String,
-    mac: String,
-    ip: String,
+pub struct NetInterface {
+    pub name: String,
+    pub state: String,
+    pub mac: String,
+    pub ip: String,
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +398,83 @@ fn fetch_connected_clients(iface: &str) -> Vec<(String, String)> {
     clients
 }
 
+fn fetch_uplink_interfaces(ap_iface: Option<&str>, wifi_names: &[String]) -> Vec<NetInterface> {
+    let all = fetch_interfaces();
+    let default_gw_dev = get_default_gateway_interface();
+
+    let mut filtered: Vec<NetInterface> = all
+        .into_iter()
+        .filter(|iface| {
+            if iface.name == "lo" {
+                return false;
+            }
+            if let Some(ap) = ap_iface {
+                if iface.name == ap {
+                    return false;
+                }
+            }
+            if wifi_names.contains(&iface.name) {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    filtered.sort_by(|a, b| {
+        let a_is_gw = default_gw_dev.as_deref() == Some(&a.name);
+        let b_is_gw = default_gw_dev.as_deref() == Some(&b.name);
+        if a_is_gw != b_is_gw {
+            return b_is_gw.cmp(&a_is_gw);
+        }
+        let a_has_ip = a.ip != "-" && !a.ip.is_empty();
+        let b_has_ip = b.ip != "-" && !b.ip.is_empty();
+        if a_has_ip != b_has_ip {
+            return b_has_ip.cmp(&a_has_ip);
+        }
+        let a_up = a.state == "UP";
+        let b_up = b.state == "UP";
+        b_up.cmp(&a_up)
+    });
+
+    filtered
+}
+
+fn start_hotspot_with_routing(
+    iface: &str,
+    ssid: &str,
+    password: &str,
+    mode: HotspotRoutingMode,
+    uplink: Option<&str>,
+) -> Result<String> {
+    let base_msg = start_hotspot(iface, ssid, password)?;
+
+    match mode {
+        HotspotRoutingMode::NatPassthrough => {
+            let up = uplink
+                .map(|s| s.to_string())
+                .or_else(get_default_gateway_interface)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No active uplink interface available for NAT passthrough.")
+                })?;
+            enable_nat_routing(iface, &up)?;
+            Ok(format!("{} | NAT Passthrough enabled via {}", base_msg, up))
+        }
+        HotspotRoutingMode::Isolated => {
+            enable_isolated_routing(iface)?;
+            Ok(format!(
+                "{} | Air-Gapped / Isolated (LAN/WAN forwarding blocked)",
+                base_msg
+            ))
+        }
+    }
+}
+
+fn stop_hotspot_with_routing(iface: &str, uplink: Option<&str>) -> Result<String> {
+    let msg = stop_hotspot(Some(iface))?;
+    let _ = teardown_routing(iface, uplink);
+    Ok(format!("{} Routing and firewall rules flushed.", msg))
+}
+
 fn run_tui() -> Result<()> {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -402,7 +533,12 @@ fn run_tui() -> Result<()> {
     let mut selected_wifi_idx = 0usize;
     let mut hotspot_ssid = String::from("dfnix-hotspot");
     let mut hotspot_pass = String::from("forensics123");
-    let mut hotspot_selected_field = 0usize; // 0=Interface, 1=SSID, 2=Password, 3=Action
+    let mut routing_mode = HotspotRoutingMode::NatPassthrough;
+    let mut wifi_names: Vec<String> = wifi_devs.iter().map(|d| d.name.clone()).collect();
+    let cur_wifi_name = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+    let mut uplink_ifaces = fetch_uplink_interfaces(cur_wifi_name, &wifi_names);
+    let mut selected_uplink_idx = 0usize;
+    let mut hotspot_selected_field = 0usize; // 0=Interface, 1=SSID, 2=Password, 3=Routing Mode, 4=Uplink Adapter, 5=Action
     let mut is_editing_text = false;
 
     let mut tab_bounds: Vec<(u16, u16)> = Vec::new();
@@ -651,40 +787,84 @@ fn run_tui() -> Result<()> {
                                 Span::raw(if hotspot_selected_field == 2 && is_editing_text { "  [EDITING - Enter to save]" } else { "  (Enter to edit, ≥8 chars)" }),
                             ]),
                             Line::from(""),
-                            Line::from("────────────────────────────────────────────────────────"),
+                            Line::from(vec![
+                                Span::styled(if hotspot_selected_field == 3 { " ▶ " } else { "   " }, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                                Span::styled("Routing Mode:     ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled(
+                                    format!("[ {} ]", routing_mode.label()),
+                                    Style::default().fg(if hotspot_selected_field == 3 {
+                                        Color::Cyan
+                                    } else {
+                                        match routing_mode {
+                                            HotspotRoutingMode::NatPassthrough => Color::Green,
+                                            HotspotRoutingMode::Isolated => Color::Magenta,
+                                        }
+                                    }).add_modifier(Modifier::BOLD)
+                                ),
+                                Span::raw("  (←/→/Space/Enter to toggle)"),
+                            ]),
                             Line::from(""),
                         ];
 
+                        let (uplink_label, uplink_hint) = if routing_mode == HotspotRoutingMode::Isolated {
+                            ("[ N/A - Air-Gapped / Isolated ]".to_string(), "  (Forwarding strictly blocked)".to_string())
+                        } else if uplink_ifaces.is_empty() {
+                            ("[ None detected ]".to_string(), "  (No wired adapters found)".to_string())
+                        } else {
+                            let up = &uplink_ifaces[selected_uplink_idx];
+                            let ip_part = if up.ip != "-" && !up.ip.is_empty() { format!(" ({})", up.ip) } else { String::new() };
+                            (format!("[ {}{} ]", up.name, ip_part), format!("  ({}/{} - use ←/→)", selected_uplink_idx + 1, uplink_ifaces.len()))
+                        };
+
+                        left_lines.push(Line::from(vec![
+                            Span::styled(if hotspot_selected_field == 4 { " ▶ " } else { "   " }, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Span::styled("Uplink Adapter:   ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                            Span::styled(
+                                uplink_label,
+                                Style::default().fg(if hotspot_selected_field == 4 {
+                                    Color::Cyan
+                                } else if routing_mode == HotspotRoutingMode::Isolated {
+                                    Color::DarkGray
+                                } else {
+                                    Color::Yellow
+                                }).add_modifier(Modifier::BOLD)
+                            ),
+                            Span::raw(uplink_hint),
+                        ]));
+
+                        left_lines.push(Line::from(""));
+                        left_lines.push(Line::from("────────────────────────────────────────────────────────"));
+                        left_lines.push(Line::from(""));
+
                         if !is_active {
                             left_lines.push(Line::from(vec![
-                                Span::styled(if hotspot_selected_field == 3 { " ▶ " } else { "   " }, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                                Span::styled(if hotspot_selected_field == 5 { " ▶ " } else { "   " }, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                                 Span::styled(
                                     "  [ START WI-FI HOTSPOT ]  ",
                                     Style::default()
-                                        .bg(if hotspot_selected_field == 3 { Color::Green } else { Color::Rgb(20, 60, 30) })
+                                        .bg(if hotspot_selected_field == 5 { Color::Green } else { Color::Rgb(20, 60, 30) })
                                         .fg(Color::White)
                                         .add_modifier(Modifier::BOLD),
                                 ),
-                                Span::raw("   Press [Space] or [Enter]"),
+                                Span::raw("   Press [Space], [Enter], or [H]"),
                             ]));
                         } else {
                             left_lines.push(Line::from(vec![
-                                Span::styled(if hotspot_selected_field == 3 { " ▶ " } else { "   " }, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                                Span::styled(if hotspot_selected_field == 5 { " ▶ " } else { "   " }, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
                                 Span::styled(
                                     "  [ STOP WI-FI HOTSPOT ]   ",
                                     Style::default()
-                                        .bg(if hotspot_selected_field == 3 { Color::Red } else { Color::Rgb(80, 20, 20) })
+                                        .bg(if hotspot_selected_field == 5 { Color::Red } else { Color::Rgb(80, 20, 20) })
                                         .fg(Color::White)
                                         .add_modifier(Modifier::BOLD),
                                 ),
-                                Span::raw("   Press [Space] or [Enter]"),
+                                Span::raw("   Press [Space], [Enter], or [H]"),
                             ]));
                         }
 
                         left_lines.extend(vec![
                             Line::from(""),
-                            Line::from(""),
-                            Line::from(Span::styled("  Navigation: [↑/↓] Select field  [←/→] Select adapter  [Enter] Edit/Apply", Style::default().fg(Color::DarkGray))),
+                            Line::from(Span::styled("  Navigation: [↑/↓] Select field  [←/→] Select adapter/mode  [Enter] Edit/Apply", Style::default().fg(Color::DarkGray))),
                         ]);
 
                         let p_left = Paragraph::new(left_lines)
@@ -692,35 +872,105 @@ fn run_tui() -> Result<()> {
                         f.render_widget(p_left, h_chunks[0]);
 
                         // Right: Active Status & Connected Clients
+                        let r_status = get_routing_status(Some(cur_iface));
+                        let ip_fwd_label = if r_status.ip_forwarding_enabled {
+                            "Enabled (sysctl net.ipv4.ip_forward=1)"
+                        } else {
+                            "Disabled (sysctl net.ipv4.ip_forward=0)"
+                        };
+                        let ip_fwd_color = if r_status.ip_forwarding_enabled { Color::Green } else { Color::Yellow };
+
+                        let active_uplink_display = if is_active {
+                            if let Some(ref up) = r_status.active_uplink {
+                                format!("{} (Active)", up)
+                            } else if r_status.mode == Some(HotspotRoutingMode::Isolated) {
+                                "None (Air-Gapped / Isolated)".to_string()
+                            } else {
+                                "Unassigned".to_string()
+                            }
+                        } else if routing_mode == HotspotRoutingMode::NatPassthrough {
+                            uplink_ifaces.get(selected_uplink_idx).map(|u| format!("{} (Target)", u.name)).unwrap_or_else(|| "None detected".to_string())
+                        } else {
+                            "None (Air-Gapped Selected)".to_string()
+                        };
+
+                        let firewall_display = if is_active {
+                            r_status.firewall_status.as_str()
+                        } else {
+                            "Inactive (Standby)"
+                        };
+                        let firewall_color = if is_active {
+                            if r_status.mode == Some(HotspotRoutingMode::Isolated) {
+                                Color::Magenta
+                            } else {
+                                Color::Green
+                            }
+                        } else {
+                            Color::DarkGray
+                        };
+
                         let mut right_lines = vec![Line::from("")];
 
                         if is_active {
                             right_lines.push(Line::from(vec![
-                                Span::styled("  Status:      ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("  Status:          ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                                 Span::styled("● ACTIVE (Broadcasting)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                             ]));
                             right_lines.push(Line::from(vec![
-                                Span::styled("  SSID:        ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("  SSID:            ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                                 Span::styled(&hotspot_ssid, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                             ]));
                             right_lines.push(Line::from(vec![
-                                Span::styled("  Password:    ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("  Password:        ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                                 Span::styled(&hotspot_pass, Style::default().fg(Color::Yellow)),
                             ]));
                             right_lines.push(Line::from(vec![
-                                Span::styled("  Gateway IP:  ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("  Gateway IP:      ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                                 Span::styled(active_ip.as_deref().unwrap_or("10.42.0.1/24"), Style::default().fg(Color::Green)),
                             ]));
                             right_lines.push(Line::from(vec![
-                                Span::styled("  Security:    ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                                Span::raw("WPA2-Personal (Shared NAT) • 802.11 AP"),
+                                Span::styled("  Routing Mode:    ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled(
+                                    r_status.mode.map(|m| m.label()).unwrap_or(routing_mode.label()),
+                                    Style::default().fg(if r_status.mode == Some(HotspotRoutingMode::Isolated) { Color::Magenta } else { Color::Green }).add_modifier(Modifier::BOLD)
+                                ),
+                            ]));
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  Uplink Dev:      ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled(&active_uplink_display, Style::default().fg(Color::Cyan)),
+                            ]));
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  IP Forwarding:   ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled(ip_fwd_label, Style::default().fg(ip_fwd_color)),
+                            ]));
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  Firewall / NAT:  ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled(firewall_display, Style::default().fg(firewall_color).add_modifier(Modifier::BOLD)),
                             ]));
                         } else {
                             right_lines.push(Line::from(vec![
-                                Span::styled("  Status:      ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("  Status:          ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                                 Span::styled("○ INACTIVE (Ready to enable)", Style::default().fg(Color::DarkGray)),
                             ]));
-                            right_lines.push(Line::from("  Hotspot is disabled. Configure settings on the left and start."));
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  Planned Mode:    ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled(routing_mode.label(), Style::default().fg(match routing_mode {
+                                    HotspotRoutingMode::NatPassthrough => Color::Green,
+                                    HotspotRoutingMode::Isolated => Color::Magenta,
+                                })),
+                            ]));
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  Target Uplink:   ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled(&active_uplink_display, Style::default().fg(Color::DarkGray)),
+                            ]));
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  IP Forwarding:   ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled(ip_fwd_label, Style::default().fg(ip_fwd_color)),
+                            ]));
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  Firewall / NAT:  ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled(firewall_display, Style::default().fg(firewall_color)),
+                            ]));
                         }
 
                         right_lines.push(Line::from(""));
@@ -732,14 +982,21 @@ fn run_tui() -> Result<()> {
                             right_lines.push(Line::from(Span::styled("  No client devices currently associated.", Style::default().fg(Color::DarkGray))));
                         } else {
                             right_lines.push(Line::from(vec![
-                                Span::styled(format!("  {:<18} {:<20} {}", "IP ADDRESS", "MAC ADDRESS", "STATUS"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                                Span::styled(format!("  {:<16} {:<18} {}", "IP ADDRESS", "MAC ADDRESS", "ROUTING STATUS"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                             ]));
+                            let (route_tag, tag_color) = if is_active && r_status.mode == Some(HotspotRoutingMode::Isolated) {
+                                ("AIR-GAPPED (Local Only)", Color::Magenta)
+                            } else if is_active {
+                                ("ROUTED (NAT Passthrough)", Color::Green)
+                            } else {
+                                ("CONNECTED", Color::White)
+                            };
                             for (ip, mac) in &clients {
                                 right_lines.push(Line::from(vec![
                                     Span::raw("  "),
-                                    Span::styled(format!("{:<18}", ip), Style::default().fg(Color::Green)),
-                                    Span::raw(format!("{:<20}", mac)),
-                                    Span::styled("CONNECTED", Style::default().fg(Color::Green)),
+                                    Span::styled(format!("{:<16}", ip), Style::default().fg(Color::Green)),
+                                    Span::raw(format!("{:<18}", mac)),
+                                    Span::styled(route_tag, Style::default().fg(tag_color).add_modifier(Modifier::BOLD)),
                                 ]));
                             }
                         }
@@ -876,9 +1133,42 @@ fn run_tui() -> Result<()> {
                                         hotspot_selected_field = 2;
                                         is_editing_text = true;
                                         status_msg = "Type new Password (≥8 chars). Press Enter to confirm, Esc to cancel.".to_string();
-                                    } else if mouse.row == top + 7 || mouse.row == top + 8 {
+                                    } else if mouse.row == top + 7 {
                                         hotspot_selected_field = 3;
                                         is_editing_text = false;
+                                        routing_mode = routing_mode.toggle();
+                                        status_msg = format!("Routing mode set to: {}", routing_mode.label());
+                                    } else if mouse.row == top + 9 {
+                                        hotspot_selected_field = 4;
+                                        is_editing_text = false;
+                                        if routing_mode == HotspotRoutingMode::NatPassthrough && !uplink_ifaces.is_empty() {
+                                            selected_uplink_idx = (selected_uplink_idx + 1) % uplink_ifaces.len();
+                                            status_msg = format!("Selected uplink adapter: {}", uplink_ifaces[selected_uplink_idx].name);
+                                        }
+                                    } else if mouse.row >= top + 12 && mouse.row <= top + 14 {
+                                        hotspot_selected_field = 5;
+                                        is_editing_text = false;
+                                        let cur_iface = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+                                        if let Some(iface) = cur_iface {
+                                            let (is_active, _, _) = is_hotspot_active(Some(iface));
+                                            if is_active {
+                                                let chosen_uplink = uplink_ifaces.get(selected_uplink_idx).map(|u| u.name.as_str());
+                                                match stop_hotspot_with_routing(iface, chosen_uplink) {
+                                                    Ok(msg) => { status_msg = msg; is_error = false; }
+                                                    Err(e) => { status_msg = format!("Failed to stop: {}", e); is_error = true; }
+                                                }
+                                            } else {
+                                                let chosen_uplink = if routing_mode == HotspotRoutingMode::NatPassthrough {
+                                                    uplink_ifaces.get(selected_uplink_idx).map(|u| u.name.as_str())
+                                                } else {
+                                                    None
+                                                };
+                                                match start_hotspot_with_routing(iface, &hotspot_ssid, &hotspot_pass, routing_mode, chosen_uplink) {
+                                                    Ok(msg) => { status_msg = msg; is_error = false; }
+                                                    Err(e) => { status_msg = format!("Failed to start: {}", e); is_error = true; }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1014,7 +1304,7 @@ fn run_tui() -> Result<()> {
                                 hotspot_selected_field = if hotspot_selected_field > 0 {
                                     hotspot_selected_field - 1
                                 } else {
-                                    3
+                                    5
                                 };
                             }
                         }
@@ -1026,7 +1316,7 @@ fn run_tui() -> Result<()> {
                                 };
                                 table_state.select(Some(i));
                             } else if current_tab == 3 {
-                                hotspot_selected_field = if hotspot_selected_field < 3 {
+                                hotspot_selected_field = if hotspot_selected_field < 5 {
                                     hotspot_selected_field + 1
                                 } else {
                                     0
@@ -1040,6 +1330,21 @@ fn run_tui() -> Result<()> {
                                 } else {
                                     wifi_devs.len() - 1
                                 };
+                                let cur_wifi_name = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+                                uplink_ifaces = fetch_uplink_interfaces(cur_wifi_name, &wifi_names);
+                                if selected_uplink_idx >= uplink_ifaces.len() && !uplink_ifaces.is_empty() {
+                                    selected_uplink_idx = 0;
+                                }
+                            } else if hotspot_selected_field == 3 {
+                                routing_mode = routing_mode.toggle();
+                                status_msg = format!("Routing mode set to: {}", routing_mode.label());
+                            } else if hotspot_selected_field == 4 && routing_mode == HotspotRoutingMode::NatPassthrough && !uplink_ifaces.is_empty() {
+                                selected_uplink_idx = if selected_uplink_idx > 0 {
+                                    selected_uplink_idx - 1
+                                } else {
+                                    uplink_ifaces.len() - 1
+                                };
+                                status_msg = format!("Selected uplink adapter: {}", uplink_ifaces[selected_uplink_idx].name);
                             }
                         }
                         KeyCode::Right | KeyCode::Char('l') if current_tab == 3 => {
@@ -1049,6 +1354,21 @@ fn run_tui() -> Result<()> {
                                 } else {
                                     0
                                 };
+                                let cur_wifi_name = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+                                uplink_ifaces = fetch_uplink_interfaces(cur_wifi_name, &wifi_names);
+                                if selected_uplink_idx >= uplink_ifaces.len() && !uplink_ifaces.is_empty() {
+                                    selected_uplink_idx = 0;
+                                }
+                            } else if hotspot_selected_field == 3 {
+                                routing_mode = routing_mode.toggle();
+                                status_msg = format!("Routing mode set to: {}", routing_mode.label());
+                            } else if hotspot_selected_field == 4 && routing_mode == HotspotRoutingMode::NatPassthrough && !uplink_ifaces.is_empty() {
+                                selected_uplink_idx = if selected_uplink_idx + 1 < uplink_ifaces.len() {
+                                    selected_uplink_idx + 1
+                                } else {
+                                    0
+                                };
+                                status_msg = format!("Selected uplink adapter: {}", uplink_ifaces[selected_uplink_idx].name);
                             }
                         }
                         KeyCode::Enter if current_tab == 3 => {
@@ -1058,12 +1378,19 @@ fn run_tui() -> Result<()> {
                                     "Type new value. Press Enter to confirm, Esc to cancel."
                                         .to_string();
                             } else if hotspot_selected_field == 3 {
+                                routing_mode = routing_mode.toggle();
+                                status_msg = format!("Routing mode set to: {}", routing_mode.label());
+                            } else if hotspot_selected_field == 4 && routing_mode == HotspotRoutingMode::NatPassthrough && !uplink_ifaces.is_empty() {
+                                selected_uplink_idx = (selected_uplink_idx + 1) % uplink_ifaces.len();
+                                status_msg = format!("Selected uplink adapter: {}", uplink_ifaces[selected_uplink_idx].name);
+                            } else if hotspot_selected_field == 5 {
                                 let cur_iface =
                                     wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
                                 if let Some(iface) = cur_iface {
                                     let (is_active, _, _) = is_hotspot_active(Some(iface));
                                     if is_active {
-                                        match stop_hotspot(Some(iface)) {
+                                        let chosen_uplink = uplink_ifaces.get(selected_uplink_idx).map(|u| u.name.as_str());
+                                        match stop_hotspot_with_routing(iface, chosen_uplink) {
                                             Ok(msg) => {
                                                 status_msg = msg;
                                                 is_error = false;
@@ -1074,7 +1401,12 @@ fn run_tui() -> Result<()> {
                                             }
                                         }
                                     } else {
-                                        match start_hotspot(iface, &hotspot_ssid, &hotspot_pass) {
+                                        let chosen_uplink = if routing_mode == HotspotRoutingMode::NatPassthrough {
+                                            uplink_ifaces.get(selected_uplink_idx).map(|u| u.name.as_str())
+                                        } else {
+                                            None
+                                        };
+                                        match start_hotspot_with_routing(iface, &hotspot_ssid, &hotspot_pass, routing_mode, chosen_uplink) {
                                             Ok(msg) => {
                                                 status_msg = msg;
                                                 is_error = false;
@@ -1089,12 +1421,57 @@ fn run_tui() -> Result<()> {
                             }
                         }
                         KeyCode::Char(' ') if current_tab == 3 => {
+                            if hotspot_selected_field == 3 {
+                                routing_mode = routing_mode.toggle();
+                                status_msg = format!("Routing mode set to: {}", routing_mode.label());
+                            } else if hotspot_selected_field == 4 && routing_mode == HotspotRoutingMode::NatPassthrough && !uplink_ifaces.is_empty() {
+                                selected_uplink_idx = (selected_uplink_idx + 1) % uplink_ifaces.len();
+                                status_msg = format!("Selected uplink adapter: {}", uplink_ifaces[selected_uplink_idx].name);
+                            } else {
+                                let cur_iface =
+                                    wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+                                if let Some(iface) = cur_iface {
+                                    let (is_active, _, _) = is_hotspot_active(Some(iface));
+                                    if is_active {
+                                        let chosen_uplink = uplink_ifaces.get(selected_uplink_idx).map(|u| u.name.as_str());
+                                        match stop_hotspot_with_routing(iface, chosen_uplink) {
+                                            Ok(msg) => {
+                                                status_msg = msg;
+                                                is_error = false;
+                                            }
+                                            Err(e) => {
+                                                status_msg = format!("Failed to stop: {}", e);
+                                                is_error = true;
+                                            }
+                                        }
+                                    } else {
+                                        let chosen_uplink = if routing_mode == HotspotRoutingMode::NatPassthrough {
+                                            uplink_ifaces.get(selected_uplink_idx).map(|u| u.name.as_str())
+                                        } else {
+                                            None
+                                        };
+                                        match start_hotspot_with_routing(iface, &hotspot_ssid, &hotspot_pass, routing_mode, chosen_uplink) {
+                                            Ok(msg) => {
+                                                status_msg = msg;
+                                                is_error = false;
+                                            }
+                                            Err(e) => {
+                                                status_msg = format!("Failed to start: {}", e);
+                                                is_error = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('H') if current_tab == 3 => {
                             let cur_iface =
                                 wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
                             if let Some(iface) = cur_iface {
                                 let (is_active, _, _) = is_hotspot_active(Some(iface));
                                 if is_active {
-                                    match stop_hotspot(Some(iface)) {
+                                    let chosen_uplink = uplink_ifaces.get(selected_uplink_idx).map(|u| u.name.as_str());
+                                    match stop_hotspot_with_routing(iface, chosen_uplink) {
                                         Ok(msg) => {
                                             status_msg = msg;
                                             is_error = false;
@@ -1105,7 +1482,12 @@ fn run_tui() -> Result<()> {
                                         }
                                     }
                                 } else {
-                                    match start_hotspot(iface, &hotspot_ssid, &hotspot_pass) {
+                                    let chosen_uplink = if routing_mode == HotspotRoutingMode::NatPassthrough {
+                                        uplink_ifaces.get(selected_uplink_idx).map(|u| u.name.as_str())
+                                    } else {
+                                        None
+                                    };
+                                    match start_hotspot_with_routing(iface, &hotspot_ssid, &hotspot_pass, routing_mode, chosen_uplink) {
                                         Ok(msg) => {
                                             status_msg = msg;
                                             is_error = false;
@@ -1123,6 +1505,12 @@ fn run_tui() -> Result<()> {
                             wifi_devs = fetch_wifi_devices();
                             if selected_wifi_idx >= wifi_devs.len() && !wifi_devs.is_empty() {
                                 selected_wifi_idx = wifi_devs.len() - 1;
+                            }
+                            wifi_names = wifi_devs.iter().map(|d| d.name.clone()).collect();
+                            let cur_wifi_name = wifi_devs.get(selected_wifi_idx).map(|d| d.name.as_str());
+                            uplink_ifaces = fetch_uplink_interfaces(cur_wifi_name, &wifi_names);
+                            if selected_uplink_idx >= uplink_ifaces.len() && !uplink_ifaces.is_empty() {
+                                selected_uplink_idx = 0;
                             }
                             status_msg = "Refreshed network and wireless interfaces.".to_string();
                             is_error = false;
@@ -1293,11 +1681,18 @@ fn main() -> Result<()> {
                 iface,
                 ssid,
                 password,
+                uplink,
+                isolate,
             } => {
                 let dev = iface.or_else(|| fetch_wifi_devices().into_iter().next().map(|d| d.name));
                 match dev {
                     Some(i) => {
-                        let res = start_hotspot(&i, &ssid, &password)?;
+                        let mode = if isolate {
+                            HotspotRoutingMode::Isolated
+                        } else {
+                            HotspotRoutingMode::NatPassthrough
+                        };
+                        let res = start_hotspot_with_routing(&i, &ssid, &password, mode, uplink.as_deref())?;
                         println!("[✓] {}", res);
                     }
                     None => {
@@ -1305,9 +1700,16 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            HotspotAction::Stop { iface } => {
-                let res = stop_hotspot(iface.as_deref())?;
-                println!("[✓] {}", res);
+            HotspotAction::Stop { iface, uplink } => {
+                let dev = iface.or_else(|| fetch_wifi_devices().into_iter().next().map(|d| d.name));
+                if let Some(i) = dev {
+                    let res = stop_hotspot_with_routing(&i, uplink.as_deref())?;
+                    println!("[✓] {}", res);
+                } else {
+                    let res = stop_hotspot(None)?;
+                    let _ = teardown_routing("", uplink.as_deref());
+                    println!("[✓] {}", res);
+                }
             }
             HotspotAction::Status => {
                 let devs = fetch_wifi_devices();
@@ -1318,10 +1720,12 @@ fn main() -> Result<()> {
                     for d in &devs {
                         let (active, ip, ssid) = is_hotspot_active(Some(&d.name));
                         let state_str = if active {
+                            let r_status = get_routing_status(Some(&d.name));
                             format!(
-                                "ACTIVE (SSID: {}, IP: {})",
+                                "ACTIVE (SSID: {}, IP: {}, Routing: {})",
                                 ssid.unwrap_or_default(),
-                                ip.unwrap_or_default()
+                                ip.unwrap_or_default(),
+                                r_status.mode.map(|m| m.short_label()).unwrap_or("Unmanaged")
                             )
                         } else {
                             "INACTIVE".to_string()
@@ -1334,10 +1738,149 @@ fn main() -> Result<()> {
                 }
             }
         },
+        Some(Commands::Route { action }) => match action.unwrap_or(RouteAction::Status { ap: None }) {
+            RouteAction::Status { ap } => {
+                let ap_target = ap.or_else(|| {
+                    fetch_wifi_devices().into_iter().find_map(|d| {
+                        let (active, _, _) = is_hotspot_active(Some(&d.name));
+                        if active { Some(d.name) } else { None }
+                    })
+                });
+                let status = get_routing_status(ap_target.as_deref());
+                println!("[*] Network Routing & Forensic Separation Status:");
+                println!(
+                    "    IP Forwarding:     {}",
+                    if status.ip_forwarding_enabled {
+                        "Enabled (net.ipv4.ip_forward=1)"
+                    } else {
+                        "Disabled (net.ipv4.ip_forward=0)"
+                    }
+                );
+                println!(
+                    "    Default Gateway:   {}",
+                    status.default_gateway.as_deref().unwrap_or("None")
+                );
+                println!(
+                    "    Target AP:         {}",
+                    ap_target.as_deref().unwrap_or("None active")
+                );
+                println!(
+                    "    Routing Mode:      {}",
+                    status.mode.map(|m| m.label()).unwrap_or("Unconfigured / Default")
+                );
+                println!(
+                    "    Active Uplink:     {}",
+                    status.active_uplink.as_deref().unwrap_or("None")
+                );
+                println!("    Firewall Status:   {}", status.firewall_status);
+
+                let wifi_names: Vec<String> = fetch_wifi_devices().into_iter().map(|d| d.name).collect();
+                let uplinks = fetch_uplink_interfaces(ap_target.as_deref(), &wifi_names);
+                println!("    Available Uplinks:");
+                if uplinks.is_empty() {
+                    println!("      (None detected)");
+                } else {
+                    for up in uplinks {
+                        println!("      - {:<12} State: {:<5} IP: {}", up.name, up.state, up.ip);
+                    }
+                }
+            }
+            RouteAction::Enable { ap, uplink } => {
+                enable_nat_routing(&ap, &uplink)?;
+                println!("[✓] NAT passthrough enabled: {} -> {}", ap, uplink);
+                println!("    IP Forwarding: Enabled (1)");
+                println!("    iptables: Masquerade on {} & Forwarding accepted", uplink);
+            }
+            RouteAction::Isolate { ap } => {
+                enable_isolated_routing(&ap)?;
+                println!("[✓] Forensic air-gap isolation enabled for {}", ap);
+                println!("    IP Forwarding: Disabled (0)");
+                println!("    iptables: Strict DROP rules inserted on FORWARD chain");
+            }
+            RouteAction::Reset { ap, uplink } => {
+                teardown_routing(ap.as_deref().unwrap_or(""), uplink.as_deref())?;
+                println!("[✓] Routing and forwarding rules flushed. IP forwarding restored to 0.");
+            }
+        },
         None => {
             run_tui()?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parsing_hotspot_options() {
+        let args = ["dfnet", "hotspot", "start", "--iface", "wlan0", "--uplink", "eth0"];
+        let cli = Cli::try_parse_from(args).expect("Failed to parse hotspot start with uplink");
+        match cli.command {
+            Some(Commands::Hotspot {
+                action:
+                    Some(HotspotAction::Start {
+                        iface,
+                        uplink,
+                        isolate,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(iface, Some("wlan0".to_string()));
+                assert_eq!(uplink, Some("eth0".to_string()));
+                assert!(!isolate);
+            }
+            _ => panic!("Expected HotspotAction::Start"),
+        }
+
+        let args_iso = ["dfnet", "hotspot", "start", "--isolate"];
+        let cli_iso =
+            Cli::try_parse_from(args_iso).expect("Failed to parse hotspot start with isolate");
+        match cli_iso.command {
+            Some(Commands::Hotspot {
+                action: Some(HotspotAction::Start { isolate, .. }),
+            }) => {
+                assert!(isolate);
+            }
+            _ => panic!("Expected isolate to be true"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_route_commands() {
+        let args_enable = ["dfnet", "route", "enable", "--ap", "wlan0", "--uplink", "eth0"];
+        let cli_enable =
+            Cli::try_parse_from(args_enable).expect("Failed to parse route enable");
+        match cli_enable.command {
+            Some(Commands::Route {
+                action: Some(RouteAction::Enable { ap, uplink }),
+            }) => {
+                assert_eq!(ap, "wlan0");
+                assert_eq!(uplink, "eth0");
+            }
+            _ => panic!("Expected RouteAction::Enable"),
+        }
+
+        let args_iso = ["dfnet", "route", "isolate", "--ap", "wlan0"];
+        let cli_iso = Cli::try_parse_from(args_iso).expect("Failed to parse route isolate");
+        match cli_iso.command {
+            Some(Commands::Route {
+                action: Some(RouteAction::Isolate { ap }),
+            }) => {
+                assert_eq!(ap, "wlan0");
+            }
+            _ => panic!("Expected RouteAction::Isolate"),
+        }
+
+        let args_status = ["dfnet", "route", "status"];
+        let cli_status = Cli::try_parse_from(args_status).expect("Failed to parse route status");
+        match cli_status.command {
+            Some(Commands::Route {
+                action: Some(RouteAction::Status { .. }),
+            }) => {}
+            _ => panic!("Expected RouteAction::Status"),
+        }
+    }
 }

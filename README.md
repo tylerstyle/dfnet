@@ -26,33 +26,60 @@
 
 ---
 
-## 📡 Wi-Fi Hotspot (Forensic Access Point)
+## 📡 Wi-Fi Hotspot (Forensic Access Point) & Routing Modes
 
-In field investigations, connecting suspect laptops or mobile devices directly to an evidence acquisition workstation often requires an isolated, controlled wireless environment without exposing the device to production networks or the internet.
+In field investigations, connecting suspect laptops or mobile devices directly to an evidence acquisition workstation often requires a controlled wireless environment. `dfnet` provides two distinct routing architectures:
 
-`dfnet` provides a built-in Wi-Fi Hotspot manager:
-- **TUI Mode (`[4] 📡 Wi-Fi Hotspot / AP`)**:
-  - Select wireless interface from detected 802.11 adapters (with sysfs fallback).
-  - Edit **SSID** and **WPA2 Password** inline.
-  - Press `Space` or click **`[ START WI-FI HOTSPOT ]`** to broadcast.
-  - Monitor real-time client associations (IP and MAC addresses) under **Connected Evidence & Client Devices**.
-- **CLI Mode**:
-  ```bash
-  # Start hotspot on specific adapter
-  sudo dfnet hotspot start --iface wlan0 --ssid "DF-FIELD-AP" --password "Investigate2026!"
+1. **Mode A: Routed to LAN (NAT Passthrough)**:
+   - Routes connected Wi-Fi AP clients through a user-selectable uplink LAN/WAN interface (e.g. `eth0`, `enp0s31f6`).
+   - Automatically enables kernel IPv4 forwarding (`sysctl net.ipv4.ip_forward=1`).
+   - Configures `iptables` NAT Masquerade and bidirectional stateful forwarding rules between the AP interface and uplink.
+2. **Mode B: Air-Gapped / Isolated (Forensic Ingest)**:
+   - Strict forensic separation: Connected clients can only communicate with the local `dfnix` workstation (e.g. streaming images to the disk receiver, SMB/NFS evidence capture).
+   - All forwarding to external networks or the internet is strictly blocked using top-priority `iptables FORWARD -j DROP` rules and `ip_forward=0`.
 
-  # Inspect active hotspot and connected devices
-  sudo dfnet hotspot status
+### TUI Hotspot Manager (`[4] 📡 Wi-Fi Hotspot / AP`):
+- **Configuration Fields**:
+  - **Wi-Fi Interface**: Select wireless interface (use `←`/`→` or click).
+  - **Network (SSID)** & **WPA2 Password**: Inline text editing (`Enter` to edit, ≥8 chars for WPA2).
+  - **Routing Mode**: Toggle between **Routed to LAN (NAT Passthrough)** and **Air-Gapped / Isolated (Forensic Ingest)** (`←`/`→`, `Space`, or click).
+  - **Uplink Adapter**: Cycle through detected wired LAN/WAN adapters with real-time IP displays (`←`/`→` or click).
+  - **Action Button**: Launch or stop hotspot with one click or `Space`/`Enter`/`H`.
+- **Live Status & Client Matrix (Right Panel)**:
+  - Displays active SSID, Gateway IP, Routing Mode, Uplink Interface, IP Forwarding state (`net.ipv4.ip_forward`), and Firewall/NAT state.
+  - Live client association table (`ip neigh`) displaying IP, MAC address, and forensic routing state (`ROUTED` vs `AIR-GAPPED`).
+- **Clean Teardown**:
+  - Stopping the hotspot cleanly deletes all associated `iptables` rules and restores `ip_forward=0`.
 
-  # Stop and clean up hotspot connection
-  sudo dfnet hotspot stop
-  ```
-- **Companion CLI Script (`df-net` / `dfnet-cli`)**:
-  ```bash
-  sudo df-net hotspot start wlan0 DF-FIELD-AP Investigate2026!
-  sudo df-net hotspot status
-  sudo df-net hotspot stop
-  ```
+### CLI Mode:
+```bash
+# Start hotspot routed through ethernet uplink (NAT Passthrough)
+sudo dfnet hotspot start --iface wlan0 --uplink eth0 --ssid "DF-FIELD-AP" --password "Investigate2026!"
+
+# Start hotspot in strict forensic isolation (Air-Gapped)
+sudo dfnet hotspot start --iface wlan0 --isolate --ssid "DF-FIELD-AP" --password "Investigate2026!"
+
+# Inspect active hotspot and connected clients
+sudo dfnet hotspot status
+
+# Stop hotspot and flush firewall/routing rules
+sudo dfnet hotspot stop
+
+# Network routing & firewall inspection
+sudo dfnet route status
+sudo dfnet route enable --ap wlan0 --uplink eth0
+sudo dfnet route isolate --ap wlan0
+sudo dfnet route reset --ap wlan0
+```
+
+### Companion CLI Script (`df-net` / `dfnet-cli`):
+```bash
+sudo df-net hotspot start wlan0 DF-FIELD-AP Investigate2026! --uplink eth0
+sudo df-net hotspot start wlan0 DF-FIELD-AP Investigate2026! --isolate
+sudo df-net hotspot status
+sudo df-net hotspot stop
+sudo df-net route status
+```
 
 ---
 
@@ -73,10 +100,11 @@ In field investigations, connecting suspect laptops or mobile devices directly t
 - `[3] ⚡ Stream Receiver`:
   - `l`: Start listening for incoming raw disk stream
 - `[4] 📡 Wi-Fi Hotspot / AP`:
-  - `↑` / `↓`: Navigate configuration fields (Interface, SSID, Password, Action)
-  - `←` / `→`: Select wireless interface
-  - `Enter`: Edit SSID / Password or trigger Start/Stop Hotspot
-  - `Space`: Quick toggle Start/Stop Hotspot
+  - `↑` / `↓` / `k` / `j`: Navigate fields (Interface, SSID, Password, Routing Mode, Uplink Adapter, Action)
+  - `←` / `→` / `h` / `l`: Cycle interface, toggle routing mode, or select uplink adapter
+  - `Enter`: Edit SSID / Password, toggle mode, or trigger Start/Stop Hotspot
+  - `Space`: Toggle routing mode / cycle adapter when focused, or toggle Start/Stop Hotspot
+  - `H`: Quick toggle Start/Stop Hotspot
 - **Global**:
   - `r`: Refresh interfaces and devices
   - `q` / `Esc`: Quit
@@ -110,9 +138,15 @@ sudo dfnet nfs 192.168.1.50:/volume1/nas target_folder
 dfnet receive 9999 /media/target/server_disk.raw
 
 # Wi-Fi Hotspot Management
-sudo dfnet hotspot start --iface wlan0 --ssid "DF-FIELD-AP" --password "Investigate2026!"
+sudo dfnet hotspot start --iface wlan0 --ssid "DF-FIELD-AP" --password "Investigate2026!" --uplink eth0
 sudo dfnet hotspot status
 sudo dfnet hotspot stop
+
+# Network Route & Isolation Management
+sudo dfnet route status
+sudo dfnet route enable --ap wlan0 --uplink eth0
+sudo dfnet route isolate --ap wlan0
+sudo dfnet route reset
 ```
 
 ---
