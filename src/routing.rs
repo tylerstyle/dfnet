@@ -11,14 +11,14 @@ impl HotspotRoutingMode {
     pub fn label(&self) -> &'static str {
         match self {
             HotspotRoutingMode::NatPassthrough => "Routed to LAN (NAT Passthrough)",
-            HotspotRoutingMode::Isolated => "Air-Gapped / Isolated (Forensic Ingest)",
+            HotspotRoutingMode::Isolated => "Forwarding Blocked (Local Ingest)",
         }
     }
 
     pub fn short_label(&self) -> &'static str {
         match self {
             HotspotRoutingMode::NatPassthrough => "Routed to LAN",
-            HotspotRoutingMode::Isolated => "Air-Gapped / Isolated",
+            HotspotRoutingMode::Isolated => "Forwarding Blocked",
         }
     }
 
@@ -32,437 +32,432 @@ impl HotspotRoutingMode {
 
 #[derive(Debug, Clone)]
 pub struct RoutingStatus {
-    pub ip_forwarding_enabled: bool,
+    pub ip_forwarding_enabled: Option<bool>,
     pub mode: Option<HotspotRoutingMode>,
     pub active_uplink: Option<String>,
     pub firewall_status: String,
     pub default_gateway: Option<String>,
 }
 
-/// Reads current IPv4 forwarding state from procfs or sysctl
-pub fn get_ip_forwarding() -> bool {
-    if let Ok(val) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
-        return val.trim() == "1";
-    }
-    if let Ok(out) = Command::new("sysctl")
-        .args(["-n", "net.ipv4.ip_forward"])
+// Rules carry an exact owner tag. Never infer ownership from an interface substring.
+const OWNER: &str = "dfnet:";
+
+pub fn validate_interface(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.len() <= 15
+            && !name.starts_with('-')
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.:-".contains(&c)),
+        "Invalid interface name: {name}"
+    );
+    Ok(())
+}
+
+fn run(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
         .output()
-    {
-        let val = String::from_utf8_lossy(&out.stdout);
-        return val.trim() == "1";
-    }
-    false
+        .with_context(|| format!("Cannot run {program}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{program} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Sets IPv4 forwarding state via procfs and sysctl
-pub fn set_ip_forwarding(enable: bool) -> Result<()> {
-    let val_str = if enable { "1" } else { "0" };
-
-    // Try direct procfs write first
-    let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", format!("{}\n", val_str));
-
-    // Also call sysctl to notify kernel / systemd
-    let output = Command::new("sysctl")
-        .args(["-w", &format!("net.ipv4.ip_forward={}", val_str)])
-        .output();
-
-    if let Ok(out) = output {
-        if out.status.success() {
-            return Ok(());
-        }
-    }
-
-    if get_ip_forwarding() == enable {
-        return Ok(());
-    }
-
-    anyhow::bail!("Failed to set net.ipv4.ip_forward={}", val_str)
+pub fn get_ip_forwarding() -> Option<bool> {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .ok()
+        .or_else(|| run("sysctl", &["-n", "net.ipv4.ip_forward"]).ok())
+        .and_then(|s| match s.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
 }
 
-/// Detects system default gateway interface from `ip route show default`
 pub fn get_default_gateway_interface() -> Option<String> {
-    if let Ok(out) = Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-    {
-        parse_default_gateway_output(&String::from_utf8_lossy(&out.stdout))
-    } else {
-        None
-    }
+    run("ip", &["route", "show", "default"])
+        .ok()
+        .and_then(|s| parse_default_gateway_output(&s))
 }
 
 pub fn parse_default_gateway_output(output: &str) -> Option<String> {
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if let Some(pos) = parts.iter().position(|&x| x == "dev") {
-            if pos + 1 < parts.len() {
-                return Some(parts[pos + 1].to_string());
+    output
+        .lines()
+        .filter(|line| line.starts_with("default "))
+        .find_map(|line| {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            option(&parts, "dev").map(str::to_owned)
+        })
+}
+
+fn option<'a>(parts: &[&'a str], key: &str) -> Option<&'a str> {
+    parts
+        .windows(2)
+        .find(|pair| pair[0] == key)
+        .map(|pair| pair[1])
+}
+
+fn owned_rule(line: &str, ap: &str) -> bool {
+    let parts: Vec<_> = line.split_whitespace().collect();
+    let Some(tag) = option(&parts, "--comment") else {
+        return false;
+    };
+    let tag = tag.trim_matches('"');
+    if ap.is_empty() {
+        tag.strip_prefix(OWNER)
+            .is_some_and(|name| validate_interface(name).is_ok())
+    } else {
+        tag == format!("{OWNER}{ap}")
+    }
+}
+
+fn rule(program: &str, table: &str, chain: &str, ap: &str, args: &[&str]) -> Result<()> {
+    let tag = format!("{OWNER}{ap}");
+    let mut check = vec!["-w", "5", "-t", table, "-C", chain];
+    check.extend_from_slice(args);
+    check.extend_from_slice(&["-m", "comment", "--comment", &tag]);
+    let out = Command::new(program)
+        .args(&check)
+        .output()
+        .with_context(|| format!("Cannot run {program}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        out.status.code() == Some(1),
+        "Cannot inspect {program}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut insert = vec!["-w", "5", "-t", table, "-I", chain, "1"];
+    insert.extend_from_slice(&check[6..]);
+    run(program, &insert)?;
+    Ok(())
+}
+
+fn remove_owned(ap: &str, keep_drops: bool) -> Result<()> {
+    let mut failures = Vec::new();
+    for (program, table, chain) in [
+        ("iptables", "filter", "INPUT"),
+        ("iptables", "filter", "FORWARD"),
+        ("iptables", "nat", "POSTROUTING"),
+        ("ip6tables", "filter", "INPUT"),
+        ("ip6tables", "filter", "FORWARD"),
+    ] {
+        match run(program, &["-w", "5", "-t", table, "-S", chain]) {
+            Ok(output) => {
+                for line in output.lines().filter(|l| owned_rule(l, ap)) {
+                    let parts: Vec<_> = line
+                        .split_whitespace()
+                        .map(|p| p.trim_matches('"'))
+                        .collect();
+                    if parts.first() != Some(&"-A") || parts.get(1) != Some(&chain) {
+                        continue;
+                    }
+                    if keep_drops && option(&parts, "-j") == Some("DROP") {
+                        continue;
+                    }
+                    let mut delete = vec!["-w", "5", "-t", table, "-D", chain];
+                    delete.extend_from_slice(&parts[2..]);
+                    if let Err(e) = run(program, &delete) {
+                        failures.push(e.to_string());
+                    }
+                }
             }
+            Err(e) => failures.push(e.to_string()),
         }
     }
-    None
+    anyhow::ensure!(
+        failures.is_empty(),
+        "Firewall cleanup incomplete: {}",
+        failures.join("; ")
+    );
+    Ok(())
 }
 
-/// Safely executes an iptables command with stdout/stderr captured in memory.
-/// Never leaks command output or error messages to the terminal/TUI screen.
-fn iptables_exec(args: &[&str]) -> (bool, String) {
-    match Command::new("iptables").args(args).output() {
-        Ok(out) => (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ),
-        Err(e) => (false, e.to_string()),
-    }
-}
-
-/// Checks if an iptables rule exists in a given table and chain.
-/// Never outputs to stderr or stdout.
-fn iptables_rule_exists(table: Option<&str>, chain: &str, rule: &[&str]) -> bool {
-    let mut args = Vec::new();
-    if let Some(t) = table {
-        args.extend_from_slice(&["-t", t]);
-    }
-    args.extend_from_slice(&["-C", chain]);
-    args.extend_from_slice(rule);
-    let (success, _) = iptables_exec(&args);
-    success
-}
-
-/// Deletes a single occurrence of an iptables rule if it exists.
-fn iptables_delete_rule(table: Option<&str>, chain: &str, rule: &[&str]) -> bool {
-    let mut args = Vec::new();
-    if let Some(t) = table {
-        args.extend_from_slice(&["-t", t]);
-    }
-    args.extend_from_slice(&["-D", chain]);
-    args.extend_from_slice(rule);
-    let (success, _) = iptables_exec(&args);
-    success
-}
-
-/// Deletes all occurrences of an iptables rule cleanly without emitting errors when none remain.
-fn iptables_delete_all(table: Option<&str>, chain: &str, rule: &[&str]) {
-    while iptables_delete_rule(table, chain, rule) {}
-}
-
-/// Appends a rule to an iptables chain if it does not already exist.
-fn iptables_append_unique(table: Option<&str>, chain: &str, rule: &[&str]) -> Result<()> {
-    if !iptables_rule_exists(table, chain, rule) {
-        let mut args = Vec::new();
-        if let Some(t) = table {
-            args.extend_from_slice(&["-t", t]);
-        }
-        args.extend_from_slice(&["-A", chain]);
-        args.extend_from_slice(rule);
-        let (success, err) = iptables_exec(&args);
-        if !success {
-            anyhow::bail!("iptables rule append failed: {}", err);
-        }
+/// Install forwarding guards before activating an AP. IPv6 is blocked in both modes.
+/// Never change global forwarding or the administrator's existing rules.
+pub fn prepare_routing(ap: &str) -> Result<()> {
+    validate_interface(ap)?;
+    run("ip", &["link", "show", "dev", ap])?;
+    for program in ["iptables", "ip6tables"] {
+        rule(program, "filter", "FORWARD", ap, &["-i", ap, "-j", "DROP"])?;
+        rule(program, "filter", "FORWARD", ap, &["-o", ap, "-j", "DROP"])?;
+        rule(program, "filter", "INPUT", ap, &["-i", ap, "-j", "DROP"])?;
     }
     Ok(())
 }
 
-/// Inserts a rule at position 1 of an iptables chain if it does not already exist.
-fn iptables_insert_unique(table: Option<&str>, chain: &str, pos: usize, rule: &[&str]) -> Result<()> {
-    if !iptables_rule_exists(table, chain, rule) {
-        let mut args = Vec::new();
-        if let Some(t) = table {
-            args.extend_from_slice(&["-t", t]);
-        }
-        let pos_str = pos.to_string();
-        args.extend_from_slice(&["-I", chain, &pos_str]);
-        args.extend_from_slice(rule);
-        let (success, err) = iptables_exec(&args);
-        if !success {
-            anyhow::bail!("iptables rule insert failed: {}", err);
-        }
+fn allow_ingest(ap: &str) -> Result<()> {
+    // Only DHCP, DNS, the default receiver and replies to workstation traffic.
+    for args in [
+        vec![
+            "-i",
+            ap,
+            "-p",
+            "udp",
+            "-m",
+            "multiport",
+            "--dports",
+            "53,67",
+            "-j",
+            "ACCEPT",
+        ],
+        vec![
+            "-i",
+            ap,
+            "-p",
+            "tcp",
+            "-m",
+            "multiport",
+            "--dports",
+            "53,9999",
+            "-j",
+            "ACCEPT",
+        ],
+        vec![
+            "-i",
+            ap,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ],
+    ] {
+        rule("iptables", "filter", "INPUT", ap, &args)?;
     }
     Ok(())
 }
 
-/// Enables NAT Masquerade on uplink and forward rules between AP interface and uplink
-pub fn enable_nat_routing(ap_iface: &str, uplink: &str) -> Result<()> {
-    if ap_iface.is_empty() {
-        anyhow::bail!("Wi-Fi AP interface cannot be empty.");
+pub fn enable_isolated_routing(ap: &str) -> Result<()> {
+    prepare_routing(ap)?;
+    remove_owned(ap, true)?;
+    allow_ingest(ap)
+}
+
+pub fn validate_uplink(ap: &str, uplink: &str) -> Result<()> {
+    validate_interface(ap)?;
+    validate_interface(uplink)?;
+    anyhow::ensure!(ap != uplink, "AP and uplink must be different interfaces");
+    anyhow::ensure!(
+        get_default_gateway_interface().as_deref() == Some(uplink),
+        "Uplink must be the current default-route interface; configure the system route first"
+    );
+    Ok(())
+}
+
+pub fn enable_nat_routing(ap: &str, uplink: &str) -> Result<()> {
+    validate_uplink(ap, uplink)?;
+    anyhow::ensure!(
+        get_ip_forwarding() == Some(true),
+        "IPv4 forwarding must already be enabled (NetworkManager sharing enables it for hotspots)"
+    );
+    let output = run("ip", &["-j", "-4", "addr", "show", "dev", ap])?;
+    let addresses: serde_json::Value = serde_json::from_str(&output)?;
+    let address = addresses
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|v| v["addr_info"].as_array().into_iter().flatten())
+        .find(|v| v["scope"] == "global")
+        .context("AP has no global IPv4 address")?;
+    let ip: std::net::Ipv4Addr = address["local"]
+        .as_str()
+        .context("Missing AP IPv4 address")?
+        .parse()?;
+    let prefix = address["prefixlen"]
+        .as_u64()
+        .filter(|p| *p <= 32)
+        .context("Invalid AP prefix")?;
+    let subnet = format!("{ip}/{prefix}");
+    prepare_routing(ap)?;
+    remove_owned(ap, true)?;
+    let result = (|| -> Result<()> {
+        allow_ingest(ap)?;
+        rule(
+            "iptables",
+            "nat",
+            "POSTROUTING",
+            ap,
+            &["-s", &subnet, "-o", uplink, "-j", "MASQUERADE"],
+        )?;
+        rule(
+            "iptables",
+            "filter",
+            "FORWARD",
+            ap,
+            &[
+                "-i",
+                uplink,
+                "-o",
+                ap,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+        rule(
+            "iptables",
+            "filter",
+            "FORWARD",
+            ap,
+            &["-i", ap, "-o", uplink, "-s", &subnet, "-j", "ACCEPT"],
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // Retain the guards if setup fails, including on the standalone route CLI.
+        if let Err(cleanup) = remove_owned(ap, true) {
+            anyhow::bail!("{error:#}; rollback failed: {cleanup:#}");
+        }
+        return Err(error);
     }
-    if uplink.is_empty() {
-        anyhow::bail!("Uplink interface cannot be empty for NAT passthrough.");
+    Ok(())
+}
+
+pub fn teardown_routing(ap: &str, _uplink: Option<&str>) -> Result<()> {
+    if !ap.is_empty() {
+        validate_interface(ap)?;
     }
+    remove_owned(ap, false)
+}
 
-    // 1. Teardown any conflicting rules for this AP interface
-    let _ = teardown_routing(ap_iface, Some(uplink));
+/// Describe configured dfnet rules, not a claim that every firewall backend was audited.
+pub fn get_routing_status(ap: Option<&str>) -> RoutingStatus {
+    let mut status = RoutingStatus {
+        ip_forwarding_enabled: get_ip_forwarding(),
+        mode: None,
+        active_uplink: None,
+        firewall_status: "No AP selected".into(),
+        default_gateway: get_default_gateway_interface(),
+    };
+    let Some(ap) = ap else {
+        return status;
+    };
+    let result = (|| -> Result<(String, String, String)> {
+        Ok((
+            run("iptables", &["-w", "5", "-S", "FORWARD"])?,
+            run("ip6tables", &["-w", "5", "-S", "FORWARD"])?,
+            run("iptables", &["-w", "5", "-t", "nat", "-S", "POSTROUTING"])?,
+        ))
+    })();
+    match result {
+        Err(e) => status.firewall_status = format!("Unknown: {e}"),
+        Ok((v4, v6, nat)) => {
+            let (mode, uplink) = configured_mode(ap, &v4, &v6, &nat);
+            status.mode = mode;
+            status.active_uplink = uplink;
+            status.firewall_status = match mode {
+                Some(HotspotRoutingMode::Isolated) => "IPv4/IPv6 forwarding guards configured",
+                Some(HotspotRoutingMode::NatPassthrough)
+                    if status.ip_forwarding_enabled == Some(true) =>
+                {
+                    "IPv4 NAT rules configured; IPv6 blocked"
+                }
+                Some(HotspotRoutingMode::NatPassthrough) => {
+                    "NAT rules present; forwarding disabled or unknown"
+                }
+                None => "Unmanaged or incomplete dfnet rules",
+            }
+            .into();
+        }
+    }
+    status
+}
 
-    // 2. Enable IPv4 forwarding
-    set_ip_forwarding(true).context("Failed to enable net.ipv4.ip_forward=1")?;
-
-    // 3. Set loose reverse path filtering so DHCP broadcast traffic is never dropped
-    let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", ap_iface), "2\n");
-    let _ = Command::new("sysctl")
-        .args(["-w", &format!("net.ipv4.conf.{}.rp_filter=2", ap_iface)])
-        .output();
-
-    // 4. Allow DHCP (port 67), DNS (port 53), and local ingest services on AP interface
-    iptables_insert_unique(None, "INPUT", 1, &["-i", ap_iface, "-j", "ACCEPT"])
-        .context("Failed to insert iptables INPUT rule for ap_iface")?;
-
-    // 5. Masquerade on uplink
-    iptables_append_unique(
-        Some("nat"),
-        "POSTROUTING",
-        &["-o", uplink, "-j", "MASQUERADE"],
-    )
-    .context("Failed to configure iptables NAT Masquerade on uplink")?;
-
-    // 6. FORWARD rule from ap_iface to uplink
-    iptables_append_unique(
-        None,
-        "FORWARD",
-        &["-i", ap_iface, "-o", uplink, "-j", "ACCEPT"],
-    )
-    .context("Failed to configure iptables FORWARD out rule")?;
-
-    // 7. FORWARD return rule from uplink to ap_iface for established / related traffic
-    let conntrack_rule = [
-        "-i",
-        uplink,
-        "-o",
-        ap_iface,
-        "-m",
-        "conntrack",
-        "--ctstate",
-        "RELATED,ESTABLISHED",
-        "-j",
-        "ACCEPT",
-    ];
-    let state_rule = [
-        "-i",
-        uplink,
-        "-o",
-        ap_iface,
-        "-m",
-        "state",
-        "--state",
-        "RELATED,ESTABLISHED",
-        "-j",
-        "ACCEPT",
-    ];
-
-    if !iptables_rule_exists(None, "FORWARD", &conntrack_rule)
-        && !iptables_rule_exists(None, "FORWARD", &state_rule)
+fn configured_mode(
+    ap: &str,
+    v4: &str,
+    v6: &str,
+    nat: &str,
+) -> (Option<HotspotRoutingMode>, Option<String>) {
+    let rules = |text: &str| {
+        text.lines()
+            .filter(|line| owned_rule(line, ap))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let v4 = rules(v4);
+    let v6 = rules(v6);
+    let has_drop = |rules: &[String], direction| {
+        rules.iter().any(|line| {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            option(&parts, direction) == Some(ap) && option(&parts, "-j") == Some("DROP")
+        })
+    };
+    if ![&v4, &v6]
+        .iter()
+        .all(|r| has_drop(r, "-i") && has_drop(r, "-o"))
     {
-        // Try modern conntrack first
-        if iptables_append_unique(None, "FORWARD", &conntrack_rule).is_err() {
-            // Fallback to legacy state module if conntrack failed
-            iptables_append_unique(None, "FORWARD", &state_rule).context(
-                "Failed to configure iptables FORWARD return rule (both conntrack and state modules failed)",
-            )?;
-        }
+        return (None, None);
     }
-
-    Ok(())
-}
-
-/// Strictly isolates AP clients from all external networks (Air-Gapped Forensic Mode)
-pub fn enable_isolated_routing(ap_iface: &str) -> Result<()> {
-    if ap_iface.is_empty() {
-        anyhow::bail!("Wi-Fi AP interface cannot be empty.");
-    }
-
-    // 1. Teardown any conflicting forwarding/NAT rules
-    let _ = teardown_routing(ap_iface, None);
-
-    // 2. Disable global IP forwarding
-    let _ = set_ip_forwarding(false);
-
-    // 3. Set loose reverse path filtering so DHCP broadcast traffic is never dropped
-    let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", ap_iface), "2\n");
-    let _ = Command::new("sysctl")
-        .args(["-w", &format!("net.ipv4.conf.{}.rp_filter=2", ap_iface)])
-        .output();
-
-    // 4. Allow DHCP, DNS, and local triage/ingest services from connected AP clients
-    iptables_insert_unique(None, "INPUT", 1, &["-i", ap_iface, "-j", "ACCEPT"])
-        .context("Failed to insert iptables INPUT rule for ap_iface")?;
-
-    // 5. Strict DROP on forward traffic originating from ap_iface
-    iptables_insert_unique(None, "FORWARD", 1, &["-i", ap_iface, "-j", "DROP"])
-        .context("Failed to insert iptables DROP rule for ap_iface outbound")?;
-
-    // 6. Also block forward traffic destined to ap_iface from external networks
-    iptables_insert_unique(None, "FORWARD", 1, &["-o", ap_iface, "-j", "DROP"])
-        .context("Failed to insert iptables DROP rule for ap_iface inbound")?;
-
-    Ok(())
-}
-
-/// Flushes all forwarding and NAT rules associated with ap_iface and uplink, restoring forward state
-pub fn teardown_routing(ap_iface: &str, uplink: Option<&str>) -> Result<()> {
-    // 1. Remove INPUT and DROP rules for ap_iface
-    if !ap_iface.is_empty() {
-        iptables_delete_all(None, "INPUT", &["-i", ap_iface, "-j", "ACCEPT"]);
-        iptables_delete_all(None, "FORWARD", &["-i", ap_iface, "-j", "DROP"]);
-        iptables_delete_all(None, "FORWARD", &["-o", ap_iface, "-j", "DROP"]);
-    }
-
-    // 2. Remove known uplink rules if uplink provided
-    if let Some(up) = uplink {
-        if !ap_iface.is_empty() {
-            iptables_delete_all(None, "FORWARD", &["-i", ap_iface, "-o", up, "-j", "ACCEPT"]);
-            iptables_delete_all(
-                None,
-                "FORWARD",
-                &[
-                    "-i",
-                    up,
-                    "-o",
-                    ap_iface,
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "RELATED,ESTABLISHED",
-                    "-j",
-                    "ACCEPT",
-                ],
-            );
-            iptables_delete_all(
-                None,
-                "FORWARD",
-                &[
-                    "-i",
-                    up,
-                    "-o",
-                    ap_iface,
-                    "-m",
-                    "state",
-                    "--state",
-                    "RELATED,ESTABLISHED",
-                    "-j",
-                    "ACCEPT",
-                ],
-            );
-        }
-        iptables_delete_all(Some("nat"), "POSTROUTING", &["-o", up, "-j", "MASQUERADE"]);
-    }
-
-    // 3. Parse iptables -S to catch any remaining rules matching ap_iface in FORWARD and INPUT
-    if !ap_iface.is_empty() {
-        for chain in ["FORWARD", "INPUT"] {
-            let (success, _) = iptables_exec(&["-S", chain]);
-            if success {
-                if let Ok(out) = Command::new("iptables").args(["-S", chain]).output() {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    for line in text.lines() {
-                        if line.contains(ap_iface) && line.starts_with(&format!("-A {}", chain)) {
-                            let rule_args: Vec<&str> = line.split_whitespace().collect();
-                            if rule_args.len() >= 3 {
-                                let mut del_cmd = vec!["-D", chain];
-                                del_cmd.extend_from_slice(&rule_args[2..]);
-                                let _ = iptables_exec(&del_cmd);
-                            }
-                            // Also check if line specified an uplink interface
-                            for (idx, &part) in rule_args.iter().enumerate() {
-                                if (part == "-o" || part == "-i") && idx + 1 < rule_args.len() {
-                                    let candidate = rule_args[idx + 1];
-                                    if candidate != ap_iface && !candidate.is_empty() {
-                                        iptables_delete_all(
-                                            Some("nat"),
-                                            "POSTROUTING",
-                                            &["-o", candidate, "-j", "MASQUERADE"],
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+    for line in &v4 {
+        let parts: Vec<_> = line.split_whitespace().collect();
+        if option(&parts, "-i") == Some(ap) && option(&parts, "-j") == Some("ACCEPT") {
+            if let Some(up) = option(&parts, "-o") {
+                let has_nat = rules(nat).iter().any(|line| {
+                    let p: Vec<_> = line.split_whitespace().collect();
+                    option(&p, "-o") == Some(up) && option(&p, "-j") == Some("MASQUERADE")
+                });
+                let has_return = v4.iter().any(|line| {
+                    let p: Vec<_> = line.split_whitespace().collect();
+                    option(&p, "-i") == Some(up)
+                        && option(&p, "-o") == Some(ap)
+                        && option(&p, "-j") == Some("ACCEPT")
+                        && option(&p, "--ctstate").is_some_and(|states| {
+                            let states: Vec<_> = states.split(',').collect();
+                            states.contains(&"ESTABLISHED") && states.contains(&"RELATED")
+                        })
+                });
+                if has_nat && has_return {
+                    return (Some(HotspotRoutingMode::NatPassthrough), Some(up.into()));
                 }
+                return (None, None);
             }
         }
     }
-
-    // 4. Restore net.ipv4.ip_forward=0
-    let _ = set_ip_forwarding(false);
-
-    Ok(())
-}
-
-/// Inspects current firewall, NAT masquerade, and IP forwarding rules
-pub fn get_routing_status(ap_iface: Option<&str>) -> RoutingStatus {
-    let ip_forwarding_enabled = get_ip_forwarding();
-    let default_gateway = get_default_gateway_interface();
-
-    let mut detected_mode = None;
-    let mut detected_uplink = None;
-    let mut firewall_status = "Disabled / Inactive".to_string();
-
-    if let Some(ap) = ap_iface {
-        if let Ok(out) = Command::new("iptables").args(["-S", "FORWARD"]).output() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                if line.contains(ap) {
-                    if line.contains("-j DROP") {
-                        detected_mode = Some(HotspotRoutingMode::Isolated);
-                        firewall_status =
-                            "Isolated (Strict DROP: LAN/WAN blocked)".to_string();
-                        break;
-                    }
-                    if line.contains("-j ACCEPT") && line.contains(&format!("-i {}", ap)) {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if let Some(pos) = parts.iter().position(|&x| x == "-o") {
-                            if pos + 1 < parts.len() {
-                                let up = parts[pos + 1].to_string();
-                                detected_mode = Some(HotspotRoutingMode::NatPassthrough);
-                                detected_uplink = Some(up.clone());
-                                firewall_status =
-                                    format!("Active (NAT Passthrough -> {})", up);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    RoutingStatus {
-        ip_forwarding_enabled,
-        mode: detected_mode,
-        active_uplink: detected_uplink,
-        firewall_status,
-        default_gateway,
-    }
+    (Some(HotspotRoutingMode::Isolated), None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_routing_mode_toggle() {
-        let mode = HotspotRoutingMode::NatPassthrough;
-        assert_eq!(mode.toggle(), HotspotRoutingMode::Isolated);
-        assert_eq!(mode.toggle().toggle(), HotspotRoutingMode::NatPassthrough);
+    fn ownership_is_exact() {
+        let line = "-A FORWARD -i wlan01 -m comment --comment \"dfnet:wlan01\" -j DROP";
+        assert!(!owned_rule(line, "wlan0"));
+        assert!(owned_rule(line, "wlan01"));
+        assert!(!owned_rule("-A FORWARD -i wlan0 -j DROP", "wlan0"));
     }
-
     #[test]
-    fn test_routing_mode_labels() {
+    fn status_requires_both_families_and_directions() {
+        let drops = "-A FORWARD -i wlan0 -m comment --comment dfnet:wlan0 -j DROP\n-A FORWARD -o wlan0 -m comment --comment dfnet:wlan0 -j DROP";
+        assert_eq!(configured_mode("wlan0", drops, "", "").0, None);
         assert_eq!(
-            HotspotRoutingMode::NatPassthrough.label(),
-            "Routed to LAN (NAT Passthrough)"
+            configured_mode("wlan0", drops, drops, "").0,
+            Some(HotspotRoutingMode::Isolated)
         );
-        assert_eq!(
-            HotspotRoutingMode::Isolated.label(),
-            "Air-Gapped / Isolated (Forensic Ingest)"
-        );
+        assert_eq!(configured_mode("wlan01", drops, drops, "").0, None);
     }
-
     #[test]
-    fn test_parse_default_gateway() {
-        let sample = "default via 192.168.178.1 dev enp0s31f6 proto dhcp src 192.168.178.80 metric 100\n";
+    fn validates_interfaces_and_gateway() {
+        for invalid in ["", "wlan+", "../x", "--help", "a b", "abcdefghijklmnop"] {
+            assert!(validate_interface(invalid).is_err());
+        }
+        assert!(validate_interface("wlan0").is_ok());
         assert_eq!(
-            parse_default_gateway_output(sample),
-            Some("enp0s31f6".to_string())
+            parse_default_gateway_output("default via 192.0.2.1 dev eth0 metric 10"),
+            Some("eth0".into())
         );
-
-        let empty = "";
-        assert_eq!(parse_default_gateway_output(empty), None);
+        assert_eq!(parse_default_gateway_output(""), None);
     }
 }
