@@ -1,179 +1,155 @@
-# dfnet 🌐🔒
-> **Modern Forensic Network Operations, Stealth MAC Cloaking, Share Ingestion, Wi-Fi Hotspot AP & Raw Stream Receiver TUI for Digital Forensics and Incident Response.**
+# dfnet
 
-`dfnet` is a high-performance terminal utility designed for DFIR examiners, incident responders, and forensic field investigators. It provides fast network interface management, instantaneous MAC address randomization/cloaking, local subnet ARP reconnaissance (locating NAS/SAN devices), remote SMB/NFS share mounting, Wi-Fi hotspot AP creation for ad-hoc field ingest, and raw network disk stream ingestion with an interactive **Ratatui TUI** dashboard.
+A Linux terminal interface and CLI for network triage: interface and MAC management,
+local ARP discovery, read-only SMB/NFS mounts, TCP image reception, and Wi-Fi hotspots.
+It uses NetworkManager and the system networking tools. Network operations generally
+require root; receiving into a writable directory on an unprivileged port does not.
 
----
+## Acquisition
 
-## ⚡ Key Features
+The receiver uses buffered Rust I/O and computes SHA-256 as data is written. It
+accepts one TCP connection, refuses existing images or sidecars (including symlinks),
+and creates files with owner-only permissions. The output directory must exist.
 
-- **Stealth MAC Cloaking**:
-  - One-key MAC address randomization (`macchanger -r`) to prevent logging real hardware MACs on suspect networks.
-  - One-key restoration of permanent factory hardware MAC (`macchanger -p`).
-- **Network Discovery & Reconnaissance**:
-  - Built-in local ARP scanner to enumerate connected devices, identify vendor OUIs, and flag potential network storage targets.
-- **Network Ingestion Helper**:
-  - Mounts on-premise Windows/Samba (`mount.cifs`) and NFS (`mount.nfs`) shares into `/media/target/` with read-only forensic flags.
-- **Wi-Fi Hotspot / Access Point**:
-  - Launch an isolated, on-demand forensic Wi-Fi access point directly from the TUI or CLI for triage and field acquisition.
-  - Interactive SSID and WPA2 password editing with real-time connected client tracking (`ip neigh`).
-  - Creates a dedicated local subnet (default `10.42.0.1/24`) to ingest evidence streams directly from suspect laptops, mobile phones, or IoT devices without bridging to corporate networks.
-- **Live Raw Disk Stream Receiver**:
-  - Listens on TCP port (default `9999`) to receive piped raw disk streams (`dd | nc`) directly to attached ingestion media with `pv` rate monitoring and on-the-fly SHA-256 hash manifest creation.
-- **Modern TUI with Mouse & Keyboard Control**:
-  - High-contrast categorized tab bar with numbered badges (`[1]` to `[4]`).
-  - Full mouse support: click tabs, click interface rows, click Wi-Fi configuration fields, and scroll with the mouse wheel.
-
----
-
-## 📡 Wi-Fi Hotspot (Forensic Access Point) & Routing Modes
-
-In field investigations, connecting suspect laptops or mobile devices directly to an evidence acquisition workstation often requires a controlled wireless environment. `dfnet` provides two distinct routing architectures:
-
-1. **Mode A: Routed to LAN (NAT Passthrough)**:
-   - Routes connected Wi-Fi AP clients through a user-selectable uplink LAN/WAN interface (e.g. `eth0`, `enp0s31f6`).
-   - Automatically enables kernel IPv4 forwarding (`sysctl net.ipv4.ip_forward=1`).
-   - Configures `iptables` NAT Masquerade and bidirectional stateful forwarding rules between the AP interface and uplink.
-2. **Mode B: Air-Gapped / Isolated (Forensic Ingest)**:
-   - Strict forensic separation: Connected clients can only communicate with the local `dfnix` workstation (e.g. streaming images to the disk receiver, SMB/NFS evidence capture).
-   - All forwarding to external networks or the internet is strictly blocked using top-priority `iptables FORWARD -j DROP` rules and `ip_forward=0`.
-
-### TUI Hotspot Manager (`[4] 📡 Wi-Fi Hotspot / AP`):
-- **Configuration Fields**:
-  - **Wi-Fi Interface**: Select wireless interface (use `←`/`→` or click).
-  - **Network (SSID)** & **WPA2 Password**: Inline text editing (`Enter` to edit, ≥8 chars for WPA2).
-  - **Routing Mode**: Toggle between **Routed to LAN (NAT Passthrough)** and **Air-Gapped / Isolated (Forensic Ingest)** (`←`/`→`, `Space`, or click).
-  - **Uplink Adapter**: Cycle through detected wired LAN/WAN adapters with real-time IP displays (`←`/`→` or click).
-  - **Action Button**: Launch or stop hotspot with one click or `Space`/`Enter`/`H`.
-- **Live Status & Client Matrix (Right Panel)**:
-  - Displays active SSID, Gateway IP, Routing Mode, Uplink Interface, IP Forwarding state (`net.ipv4.ip_forward`), and Firewall/NAT state.
-  - Live client association table (`ip neigh`) displaying IP, MAC address, and forensic routing state (`ROUTED` vs `AIR-GAPPED`).
-- **Clean Teardown**:
-  - Stopping the hotspot cleanly deletes all associated `iptables` rules and restores `ip_forward=0`.
-
-### CLI Mode:
 ```bash
-# Start hotspot routed through ethernet uplink (NAT Passthrough)
-sudo dfnet hotspot start --iface wlan0 --uplink eth0 --ssid "DF-FIELD-AP" --password "Investigate2026!"
+mkdir -p /media/target/case01
+dfnet receive 9999 /media/target/case01/disk.raw --bind 10.42.0.1 \
+  --expected-bytes 1000000000 --expected-sha256 <64-hex-digit-source-hash>
 
-# Start hotspot in strict forensic isolation (Air-Gapped)
-sudo dfnet hotspot start --iface wlan0 --isolate --ssid "DF-FIELD-AP" --password "Investigate2026!"
+# Sender, with OpenBSD netcat; select the actual source device first.
+sudo dd if=/dev/nvme0n1 bs=1M status=progress | nc -N 10.42.0.1 9999
+```
 
-# Inspect active hotspot and connected clients
+A completed reception produces `disk.raw`, `disk.raw.sha256`, and `disk.raw.json`.
+The checksum file can be checked from the image directory with
+`sha256sum -c disk.raw.sha256`. The JSON record includes byte count, SHA-256,
+peer address, timestamps, expected values, and status:
+
+- `verified`: reception completed and the expected source hash matched.
+- `received_unverified`: reception completed without a supplied source hash.
+  TCP EOF alone cannot establish that the entire source image arrived.
+- `incomplete`: reception failed, the stream was empty, size/hash validation failed,
+  or the process was interrupted before finalization. Keep partial files for review;
+  use a new destination for another attempt.
+
+`--expected-bytes` rejects short or oversized streams. `--timeout` sets the sender
+idle timeout in seconds (default 60); waiting for the first connection is indefinite.
+Progress reports include bytes written and average throughput. The receiver no longer
+requires `nc` or `pv` locally. Raw TCP has no sender authentication or encryption;
+use a trusted acquisition network or an authenticated transport/tunnel. A hash
+record does not replace source identification or an examiner's acquisition log.
+
+## Wi-Fi hotspots and routing
+
+```bash
+# Default: block forwarding from/to AP clients. A password is generated if omitted.
+sudo dfnet hotspot start --iface wlan0 --ssid DF-FIELD-AP
+
+# Explicitly allow IPv4 NAT through the current default-route interface.
+sudo dfnet hotspot start --iface wlan0 --uplink eth0 --ssid DF-FIELD-AP
+
 sudo dfnet hotspot status
-
-# Stop hotspot and flush firewall/routing rules
 sudo dfnet hotspot stop
 
-# Network routing & firewall inspection
-sudo dfnet route status
-sudo dfnet route enable --ap wlan0 --uplink eth0
+sudo dfnet route status --ap wlan0
 sudo dfnet route isolate --ap wlan0
+sudo dfnet route enable --ap wlan0 --uplink eth0
 sudo dfnet route reset --ap wlan0
 ```
 
-### Companion CLI Script (`df-net` / `dfnet-cli`):
-```bash
-sudo df-net hotspot start wlan0 DF-FIELD-AP Investigate2026! --uplink eth0
-sudo df-net hotspot start wlan0 DF-FIELD-AP Investigate2026! --isolate
-sudo df-net hotspot status
-sudo df-net hotspot stop
-sudo df-net route status
-```
+The hotspot profile is configured for WPA2/RSN, wireless client isolation, disabled
+IPv6, and no automatic activation. Both IPv4 and IPv6 forwarding guards are installed
+**before** NetworkManager activates the AP. If either firewall family cannot be
+configured, the hotspot is not activated. `--isolate` explicitly selects the default
+blocked-forwarding mode and conflicts with `--uplink`.
 
----
+The host INPUT policy admits IPv4 DHCP, DNS, TCP port 9999, and established/related
+traffic on the AP interface; other new connections are blocked. Custom receiver
+ports and additional services need a deliberate firewall policy adjustment. IPv6
+forwarding stays blocked in both modes. NAT is scoped to the AP's IPv4 subnet.
+The selected uplink must match the current default route; dfnet does not rewrite
+system routes. Standalone `route enable` requires IPv4 forwarding already enabled.
+NetworkManager manages forwarding for shared hotspot profiles.
 
-## 🖥️ TUI Navigation & Shortcuts
+Rules are tagged with `dfnet:<interface>`. Cleanup removes only these owned rules;
+it never flushes unrelated rules or resets global forwarding/reverse-path settings.
+`route reset` without `--ap` removes all tagged dfnet rules. Stop the hotspot before
+resetting its rules: reset removes the guards too. Rules left by older dfnet releases
+have no ownership tags and require manual review rather than automatic deletion.
 
-### Navigation
-- **Category Tabs**: Click on tabs directly or press `1`, `2`, `3`, `4`, `Tab`, or `Shift+Tab` (`BackTab`).
-- **Mouse Wheel**: Scroll on the tab bar to cycle categories, or on tables to select items.
+Status describes the configured dfnet rules, not a complete audit of every firewall
+backend or policy-routing rule. This is **software forwarding control, not a physical
+air gap**. The workstation remains accessible on the allowed services; DNS and other
+host services can themselves contact external networks. Wireless client isolation
+also depends on driver support. Verify the deployment's traffic policy before use.
+The neighbor display is an ARP/neighbor cache, not an authoritative Wi-Fi association
+list. Use a dedicated acquisition host when strict separation is required.
 
-### Tab Shortcuts
-- `[1] 🌐 Interfaces & MAC Cloaking`:
-  - `↑` / `↓` / `k` / `j` (or click): Select network adapter
-  - `m`: **Randomize MAC** address on selected interface
-  - `p`: **Restore permanent MAC** address
-  - `n`: Launch **`nmtui`** (NetworkManager TUI for static IP / VLAN / Wi-Fi)
-- `[2] 🔍 Subnet Discovery & ARP`:
-  - `s`: Run **local subnet ARP scan**
-- `[3] ⚡ Stream Receiver`:
-  - `l`: Start listening for incoming raw disk stream
-- `[4] 📡 Wi-Fi Hotspot / AP`:
-  - `↑` / `↓` / `k` / `j`: Navigate fields (Interface, SSID, Password, Routing Mode, Uplink Adapter, Action)
-  - `←` / `→` / `h` / `l`: Cycle interface, toggle routing mode, or select uplink adapter
-  - `Enter`: Edit SSID / Password, toggle mode, or trigger Start/Stop Hotspot
-  - `Space`: Toggle routing mode / cycle adapter when focused, or toggle Start/Stop Hotspot
-  - `H`: Quick toggle Start/Stop Hotspot
-- **Global**:
-  - `r`: Refresh interfaces and devices
-  - `q` / `Esc`: Quit
-
----
-
-## 📦 CLI Usage
-
-`dfnet` can be run in interactive TUI mode or directly via subcommands:
+## Other commands
 
 ```bash
-# Launch interactive TUI
-sudo dfnet
-
-# Randomize MAC address
+sudo dfnet                         # TUI
+sudo dfnet ip                      # NetworkManager's nmtui
 sudo dfnet mac eth0
-
-# Restore permanent MAC
 sudo dfnet restore eth0
-
-# Scan local subnet
-sudo dfnet scan
-
-# Mount remote SMB share read-only
-sudo dfnet smb //192.168.1.50/share target_folder examiner
-
-# Mount remote NFS export read-only
-sudo dfnet nfs 192.168.1.50:/volume1/nas target_folder
-
-# Listen for incoming raw disk stream
-dfnet receive 9999 /media/target/server_disk.raw
-
-# Wi-Fi Hotspot Management
-sudo dfnet hotspot start --iface wlan0 --ssid "DF-FIELD-AP" --password "Investigate2026!" --uplink eth0
-sudo dfnet hotspot status
-sudo dfnet hotspot stop
-
-# Network Route & Isolation Management
-sudo dfnet route status
-sudo dfnet route enable --ap wlan0 --uplink eth0
-sudo dfnet route isolate --ap wlan0
-sudo dfnet route reset
+sudo dfnet scan eth0
+sudo dfnet smb //192.168.1.50/share case01 examiner
+sudo dfnet nfs 192.168.1.50:/export case01
 ```
 
----
+MAC operations restore the interface's original up/down state and report helper
+failures. Randomizing a MAC does not provide anonymity or erase prior network logs.
+Discovery runs `arp-scan` on the local IPv4 segment; it does not probe storage ports
+or prove that a discovered host is a NAS.
 
-## 🚀 Installation & Nix Usage
+Shares mount below `/media/target/smb_<name>` or `/media/target/nfs_<name>` with
+`ro,noatime,nosuid,nodev,noexec` (`nolock` additionally for NFS). Folder names reject path separators and traversal components. Read-only client access does not freeze a live server or guarantee
+that the server records no access metadata. Mounting alone does not acquire or hash
+files. Unmount with the system's `umount` command when finished.
 
-### Running with Nix Flakes
+## TUI
+
+Use `1`–`4`, Tab/Shift+Tab, or the mouse to switch tabs; `r` refreshes and `q` exits.
+
+- Interfaces: arrows or `j`/`k` select; `m` randomizes the MAC, `p` restores it, `n` opens nmtui.
+- Discovery: `s` scans the default interface.
+- Receiver: `l` receives to `/media/target/network_stream.raw` on port 9999. Use the
+  CLI for a custom destination, bind address, expected size, or expected hash.
+- Hotspot: arrows select fields/values, Enter edits, and `H` starts/stops the AP.
+
+Hotspot status is cached for two seconds; interface discovery uses a single JSON
+query to `ip`. Quitting the TUI leaves a running hotspot active; stop it explicitly
+with `dfnet hotspot stop`.
+
+## Compatibility commands
+
+Nix installs `dfnet-cli` and `df-net`, which translate older positional forms and
+then execute the same Rust backend. There is no separate networking implementation.
+
 ```bash
-# Run directly from GitHub
-nix run github:tylerstyle/dfnet
+sudo df-net hotspot start wlan0 DF-FIELD-AP 'a-unique-passphrase' --isolate
+sudo df-net route enable wlan0 eth0
+sudo df-net mac-restore eth0
+```
 
-# Build package locally
+## Build and checks
+
+```bash
+cargo build --locked
+cargo test --locked
+
 nix build .#dfnet
-```
-
-### Developing
-```bash
-# Enter development shell with cargo, rustc, and tools
 nix develop
 ```
 
----
+Runtime dependencies: `iproute2`, NetworkManager (including its hotspot DHCP/DNS
+support), `iptables`/`ip6tables`, `macchanger`, `arp-scan`, `cifs-utils`, and `nfs-utils`.
+The Nix package wraps the executable with its command dependencies; the host must
+still run NetworkManager and support AP mode and both firewall families.
 
-## 📜 License
+Tests cover real loopback TCP transfers and use mocked commands for firewall and
+NetworkManager operations. They require Bash and permission to bind loopback sockets;
+they do not modify the host network. Live AP/driver and firewall interoperability
+still need testing on a dedicated host or VM.
 
-This project is dual-licensed under either:
-* **MIT License** ([LICENSE-MIT](LICENSE-MIT))
-* **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE))
-
-See [LICENSE](LICENSE) for details.
+Dual licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).

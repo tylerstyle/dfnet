@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "dfnet"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -387,6 +387,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

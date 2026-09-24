@@ -1,5 +1,5 @@
 {
-  description = "Modern forensic network triage, stealth MAC cloaking, share ingest & Wi-Fi AP TUI";
+  description = "Linux network triage, MAC management, share access and Wi-Fi AP TUI";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -7,7 +7,7 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
         dfnet = pkgs.callPackage ./package.nix { };

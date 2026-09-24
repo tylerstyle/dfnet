@@ -6,8 +6,6 @@
 , arp-scan
 , cifs-utils
 , nfs-utils
-, netcat-openbsd
-, pv
 , iproute2
 , util-linux
 , iptables
@@ -16,7 +14,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "dfnet";
-  version = "0.1.2";
+  version = "0.1.3";
 
   src = lib.cleanSource ./.;
 
@@ -32,7 +30,7 @@ rustPlatform.buildRustPackage {
     chmod +x $out/bin/dfnet-cli
 
     # Compatibility symlink
-    ln -s $out/bin/dfnet $out/bin/df-net
+    ln -s $out/bin/dfnet-cli $out/bin/df-net
 
     wrapProgram $out/bin/dfnet \
       --prefix PATH : ${lib.makeBinPath [
@@ -41,8 +39,6 @@ rustPlatform.buildRustPackage {
         arp-scan
         cifs-utils
         nfs-utils
-        netcat-openbsd
-        pv
         iproute2
         util-linux
         iptables
@@ -50,14 +46,13 @@ rustPlatform.buildRustPackage {
       ]}
 
     wrapProgram $out/bin/dfnet-cli \
+      --prefix PATH : $out/bin \
       --prefix PATH : ${lib.makeBinPath [
         macchanger
         networkmanager
         arp-scan
         cifs-utils
         nfs-utils
-        netcat-openbsd
-        pv
         iproute2
         util-linux
         iptables
@@ -83,7 +78,7 @@ EOF
   '';
 
   meta = with lib; {
-    description = "Modern forensic network triage, stealth MAC cloaking & stream ingest TUI";
+    description = "Linux network triage, MAC management and stream acquisition TUI";
     homepage = "https://github.com/tylerstyle/dfnet";
     license = with licenses; [ mit asl20 ];
     mainProgram = "dfnet";
