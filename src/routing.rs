@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use std::process::Command;
+use serde::{Deserialize, Serialize};
+use std::{net::Ipv4Addr, path::PathBuf, process::Command};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotspotRoutingMode {
@@ -69,14 +70,198 @@ fn run(program: &str, args: &[&str]) -> Result<String> {
 }
 
 pub fn get_ip_forwarding() -> Option<bool> {
-    std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+    run("sysctl", &["-n", "net.ipv4.ip_forward"])
         .ok()
-        .or_else(|| run("sysctl", &["-n", "net.ipv4.ip_forward"]).ok())
+        .or_else(|| std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").ok())
         .and_then(|s| match s.trim() {
             "1" => Some(true),
             "0" => Some(false),
             _ => None,
         })
+}
+
+fn set_ip_forwarding(enabled: bool) -> Result<()> {
+    let value = if enabled { "1" } else { "0" };
+    run("sysctl", &["-w", &format!("net.ipv4.ip_forward={value}")])?;
+    anyhow::ensure!(
+        get_ip_forwarding() == Some(enabled),
+        "net.ipv4.ip_forward did not change to {value}"
+    );
+    Ok(())
+}
+
+/// Global IPv4 address and prefix of an interface, from `ip -j -4 addr show dev`.
+pub fn parse_global_ipv4(json: &str) -> Result<(Ipv4Addr, u8)> {
+    let addresses: serde_json::Value = serde_json::from_str(json)?;
+    let address = addresses
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|v| v["addr_info"].as_array().into_iter().flatten())
+        .find(|v| v["scope"] == "global" && v["family"] != "inet6")
+        .context("Interface has no global IPv4 address")?;
+    let ip: Ipv4Addr = address["local"]
+        .as_str()
+        .context("Missing IPv4 address")?
+        .parse()?;
+    let prefix = address["prefixlen"]
+        .as_u64()
+        .filter(|p| *p <= 32)
+        .context("Invalid IPv4 prefix")?;
+    Ok((ip, prefix as u8))
+}
+
+pub fn interface_ipv4(iface: &str) -> Result<(Ipv4Addr, u8)> {
+    validate_interface(iface)?;
+    parse_global_ipv4(&run("ip", &["-j", "-4", "addr", "show", "dev", iface])?)
+        .with_context(|| format!("No usable IPv4 address on {iface}"))
+}
+
+// NetworkManager's "shared" IPv4 method turns on net.ipv4.ip_forward for the whole
+// host and leaves it on when the connection goes down. The value found before the
+// first hotspot start is kept under /run (cleared on reboot, like the sysctl itself)
+// so a later `hotspot stop`, possibly from another process, can put it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ForwardingState {
+    ap: String,
+    ip_forward_before: bool,
+}
+
+fn state_path() -> PathBuf {
+    std::env::var_os("DFNET_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/dfnet"))
+        .join("ip_forward.json")
+}
+
+/// Record the pre-hotspot forwarding state. An existing record is kept: it holds the
+/// value from before the first of several restarts.
+pub fn remember_ip_forwarding(ap: &str) -> Result<()> {
+    let path = state_path();
+    if path.exists() {
+        return Ok(());
+    }
+    let before = get_ip_forwarding().context("Cannot read net.ipv4.ip_forward")?;
+    std::fs::create_dir_all(path.parent().expect("state path has a parent"))?;
+    let state = ForwardingState {
+        ap: ap.into(),
+        ip_forward_before: before,
+    };
+    std::fs::write(&path, serde_json::to_vec(&state)?)
+        .with_context(|| format!("Cannot record forwarding state in {}", path.display()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardingAction {
+    Disable,
+    Keep(String),
+}
+
+pub fn forwarding_action(
+    before: Option<bool>,
+    now: Option<bool>,
+    other_shared: &[String],
+) -> ForwardingAction {
+    match (before, now) {
+        (_, Some(false)) => ForwardingAction::Keep("IPv4 forwarding is disabled".into()),
+        (Some(true), _) => {
+            ForwardingAction::Keep("IPv4 forwarding was already enabled before the hotspot".into())
+        }
+        (Some(false), _) if !other_shared.is_empty() => ForwardingAction::Keep(format!(
+            "IPv4 forwarding left enabled: shared connection(s) {} still active",
+            other_shared.join(", ")
+        )),
+        (Some(false), _) => ForwardingAction::Disable,
+        (None, _) => ForwardingAction::Keep(
+            "IPv4 forwarding left as is: no state recorded before the hotspot started \
+             (check `sysctl net.ipv4.ip_forward`)"
+                .into(),
+        ),
+    }
+}
+
+/// Active NetworkManager connections other than ours that use IPv4 sharing.
+fn other_shared_connections() -> Result<Vec<String>> {
+    let active = run(
+        "nmcli",
+        &["-t", "-f", "NAME,UUID", "connection", "show", "--active"],
+    )?;
+    let mut shared = Vec::new();
+    for line in active.lines() {
+        let Some((name, uuid)) = line.rsplit_once(':') else {
+            continue;
+        };
+        if name == "dfnet-hotspot" {
+            continue;
+        }
+        let method = run("nmcli", &["-g", "ipv4.method", "connection", "show", uuid])?;
+        if method.trim() == "shared" {
+            shared.push(name.to_string());
+        }
+    }
+    Ok(shared)
+}
+
+/// Put net.ipv4.ip_forward back to its pre-hotspot value. Call after the AP is down.
+pub fn restore_ip_forwarding() -> Result<String> {
+    let path = state_path();
+    let before = match std::fs::read(&path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<ForwardingState>(&bytes)
+                .with_context(|| format!("Corrupt forwarding state {}", path.display()))?
+                .ip_forward_before,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("Cannot read {}", path.display())),
+    };
+    let now = get_ip_forwarding();
+    let others = if before == Some(false) && now == Some(true) {
+        other_shared_connections()?
+    } else {
+        Vec::new()
+    };
+    let message = match forwarding_action(before, now, &others) {
+        ForwardingAction::Disable => {
+            set_ip_forwarding(false)?;
+            "IPv4 forwarding restored to disabled (net.ipv4.ip_forward=0).".to_string()
+        }
+        ForwardingAction::Keep(reason) => format!("{reason}."),
+    };
+    if before.is_some() {
+        std::fs::remove_file(&path).with_context(|| format!("Cannot remove {}", path.display()))?;
+    }
+    Ok(message)
+}
+
+/// Remove the nftables table NetworkManager creates for a shared connection if it
+/// outlived the connection. Absent `nft` means there is nothing of ours to check.
+pub fn remove_stale_nm_shared_table(ap: &str) -> Result<Option<String>> {
+    validate_interface(ap)?;
+    let tables = match Command::new("nft").args(["list", "tables"]).output() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("Cannot run nft"),
+        Ok(out) => {
+            anyhow::ensure!(
+                out.status.success(),
+                "nft list tables failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+    };
+    let table = format!("nm-shared-{ap}");
+    if !stale_shared_table(&tables, &table) {
+        return Ok(None);
+    }
+    run("nft", &["delete", "table", "ip", &table])?;
+    Ok(Some(format!("Removed leftover nftables table ip {table}.")))
+}
+
+fn stale_shared_table(nft_tables: &str, table: &str) -> bool {
+    nft_tables.lines().any(|line| {
+        let parts: Vec<_> = line.split_whitespace().collect();
+        parts == ["table", "ip", table]
+    })
 }
 
 pub fn get_default_gateway_interface() -> Option<String> {
@@ -258,23 +443,7 @@ pub fn enable_nat_routing(ap: &str, uplink: &str) -> Result<()> {
         get_ip_forwarding() == Some(true),
         "IPv4 forwarding must already be enabled (NetworkManager sharing enables it for hotspots)"
     );
-    let output = run("ip", &["-j", "-4", "addr", "show", "dev", ap])?;
-    let addresses: serde_json::Value = serde_json::from_str(&output)?;
-    let address = addresses
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|v| v["addr_info"].as_array().into_iter().flatten())
-        .find(|v| v["scope"] == "global")
-        .context("AP has no global IPv4 address")?;
-    let ip: std::net::Ipv4Addr = address["local"]
-        .as_str()
-        .context("Missing AP IPv4 address")?
-        .parse()?;
-    let prefix = address["prefixlen"]
-        .as_u64()
-        .filter(|p| *p <= 32)
-        .context("Invalid AP prefix")?;
+    let (ip, prefix) = interface_ipv4(ap).context("AP has no global IPv4 address")?;
     let subnet = format!("{ip}/{prefix}");
     prepare_routing(ap)?;
     remove_owned(ap, true)?;
@@ -448,6 +617,59 @@ mod tests {
         );
         assert_eq!(configured_mode("wlan01", drops, drops, "").0, None);
     }
+    #[test]
+    fn forwarding_is_only_disabled_when_we_turned_it_on() {
+        use ForwardingAction::*;
+        assert_eq!(forwarding_action(Some(false), Some(true), &[]), Disable);
+        assert!(matches!(
+            forwarding_action(Some(true), Some(true), &[]),
+            Keep(_)
+        ));
+        assert!(matches!(
+            forwarding_action(Some(false), Some(false), &[]),
+            Keep(_)
+        ));
+        assert!(
+            matches!(forwarding_action(None, Some(true), &[]), Keep(r) if r.contains("no state recorded"))
+        );
+        let other = vec!["Hotspot-eth1".to_string()];
+        assert!(
+            matches!(forwarding_action(Some(false), Some(true), &other), Keep(r) if r.contains("Hotspot-eth1"))
+        );
+        // Unknown current value with a recorded "off" still tries to switch it off
+        assert_eq!(forwarding_action(Some(false), None, &[]), Disable);
+    }
+
+    #[test]
+    fn nm_shared_table_match_is_exact() {
+        let tables = "table inet filter\ntable ip nm-shared-wlan01\ntable ip nm-shared-wlan0\n";
+        assert!(stale_shared_table(tables, "nm-shared-wlan0"));
+        assert!(!stale_shared_table(
+            "table ip nm-shared-wlan01\n",
+            "nm-shared-wlan0"
+        ));
+        assert!(!stale_shared_table(
+            "table inet nm-shared-wlan0\n",
+            "nm-shared-wlan0"
+        ));
+    }
+
+    #[test]
+    fn parses_global_ipv4() {
+        let json = r#"[{"ifname":"wlan0","addr_info":[
+            {"family":"inet","local":"127.0.0.1","prefixlen":8,"scope":"host"},
+            {"family":"inet","local":"10.42.0.1","prefixlen":24,"scope":"global"}]}]"#;
+        assert_eq!(
+            parse_global_ipv4(json).unwrap(),
+            ("10.42.0.1".parse().unwrap(), 24)
+        );
+        assert!(parse_global_ipv4("[]").is_err());
+        assert!(parse_global_ipv4(
+            r#"[{"addr_info":[{"local":"10.0.0.1","prefixlen":40,"scope":"global"}]}]"#
+        )
+        .is_err());
+    }
+
     #[test]
     fn validates_interfaces_and_gateway() {
         for invalid in ["", "wlan+", "../x", "--help", "a b", "abcdefghijklmnop"] {

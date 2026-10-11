@@ -11,13 +11,29 @@ The receiver uses buffered Rust I/O and computes SHA-256 as data is written. It
 accepts one TCP connection, refuses existing images or sidecars (including symlinks),
 and creates files with owner-only permissions. The output directory must exist.
 
+Every reception is checked against the exact source size and SHA-256:
+
+- `--bind <address>` or `--interface <name>` is required. The receiver listens on that
+  one address; `0.0.0.0`, `::`, broadcast and multicast addresses are refused.
+- `--expected-bytes` is required (sender: `blockdev --getsize64 <device>`).
+- The source hash is either given up front with `--expected-sha256`, or entered on
+  stdin after the transfer with `--prompt-sha256`. The latter lets the sender hash
+  while streaming, so the source is read only once; the receiver does not print its
+  own hash until the sender's hash has been entered.
+- `--allow-peer <address>` (repeatable) accepts only those senders. Other connections
+  are closed, logged in the manifest's `rejected_peers`, and do not use up the single
+  acquisition connection.
+
 ```bash
 mkdir -p /media/target/case01
-dfnet receive 9999 /media/target/case01/disk.raw --bind 10.42.0.1 \
-  --expected-bytes 1000000000 --expected-sha256 <64-hex-digit-source-hash>
+dfnet receive 9999 /media/target/case01/disk.raw --interface wlan0 \
+  --expected-bytes 1000204886016 --allow-peer 10.42.0.23 --prompt-sha256
 
 # Sender, with OpenBSD netcat; select the actual source device first.
-sudo dd if=/dev/nvme0n1 bs=1M status=progress | nc -N 10.42.0.1 9999
+sudo blockdev --getsize64 /dev/nvme0n1
+sudo dd if=/dev/nvme0n1 bs=1M status=progress | tee >(sha256sum > source.sha256) \
+  | nc -N 10.42.0.1 9999
+# Then type the hash from source.sha256 at the receiver's prompt.
 ```
 
 A completed reception produces `disk.raw`, `disk.raw.sha256`, and `disk.raw.json`.
@@ -25,17 +41,16 @@ The checksum file can be checked from the image directory with
 `sha256sum -c disk.raw.sha256`. The JSON record includes byte count, SHA-256,
 peer address, timestamps, expected values, and status:
 
-- `verified`: reception completed and the expected source hash matched.
-- `received_unverified`: reception completed without a supplied source hash.
-  TCP EOF alone cannot establish that the entire source image arrived.
+- `verified`: reception completed with the expected size and the expected source hash.
 - `incomplete`: reception failed, the stream was empty, size/hash validation failed,
-  or the process was interrupted before finalization. Keep partial files for review;
-  use a new destination for another attempt.
+  no hash was entered, or the process was interrupted before finalization. Keep
+  partial files for review; use a new destination for another attempt.
 
-`--expected-bytes` rejects short or oversized streams. `--timeout` sets the sender
+Short or oversized streams are rejected. `--timeout` sets the sender
 idle timeout in seconds (default 60); waiting for the first connection is indefinite.
 Progress reports include bytes written and average throughput. The receiver no longer
-requires `nc` or `pv` locally. Raw TCP has no sender authentication or encryption;
+requires `nc` or `pv` locally. Raw TCP has no sender authentication or encryption:
+the sender allowlist is address-based and the hash check is what proves integrity, so
 use a trusted acquisition network or an authenticated transport/tunnel. A hash
 record does not replace source identification or an examiner's acquisition log.
 
@@ -69,10 +84,16 @@ ports and additional services need a deliberate firewall policy adjustment. IPv6
 forwarding stays blocked in both modes. NAT is scoped to the AP's IPv4 subnet.
 The selected uplink must match the current default route; dfnet does not rewrite
 system routes. Standalone `route enable` requires IPv4 forwarding already enabled.
-NetworkManager manages forwarding for shared hotspot profiles.
+
+NetworkManager's shared mode switches on global `net.ipv4.ip_forward` and leaves it
+on after the AP goes down. `hotspot start` therefore records the value found before
+the first start in `/run/dfnet/ip_forward.json`, and `hotspot stop` (also a failed
+start's rollback) sets it back to `0` if it was off before, unless another active
+NetworkManager connection still uses IPv4 sharing. It also deletes a leftover
+`nm-shared-<ap>` nftables table if NetworkManager did not remove it.
 
 Rules are tagged with `dfnet:<interface>`. Cleanup removes only these owned rules;
-it never flushes unrelated rules or resets global forwarding/reverse-path settings.
+it never flushes unrelated rules. `route reset` leaves global forwarding unchanged.
 `route reset` without `--ap` removes all tagged dfnet rules. Stop the hotspot before
 resetting its rules: reset removes the guards too. Rules left by older dfnet releases
 have no ownership tags and require manual review rather than automatic deletion.
@@ -113,8 +134,9 @@ Use `1`–`4`, Tab/Shift+Tab, or the mouse to switch tabs; `r` refreshes and `q`
 
 - Interfaces: arrows or `j`/`k` select; `m` randomizes the MAC, `p` restores it, `n` opens nmtui.
 - Discovery: `s` scans the default interface.
-- Receiver: `l` receives to `/media/target/network_stream.raw` on port 9999. Use the
-  CLI for a custom destination, bind address, expected size, or expected hash.
+- Receiver: `l` asks for the listen interface or address, the exact source size, an
+  optional sender address, the source hash (or to enter it after the transfer) and
+  the destination (default `/media/target/network_stream.raw`), then receives on 9999.
 - Hotspot: arrows select fields/values, Enter edits, and `H` starts/stops the AP.
 
 Hotspot status is cached for two seconds; interface discovery uses a single JSON

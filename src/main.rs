@@ -63,15 +63,33 @@ enum Commands {
     Receive {
         port: Option<u16>,
         out: Option<String>,
-        /// Local address on which to accept a single TCP stream
-        #[arg(long, default_value = "0.0.0.0")]
-        bind: std::net::IpAddr,
-        /// Expected source size; reject short or oversized streams
+        /// Local address on which to accept a single TCP stream (never 0.0.0.0 / ::)
+        #[arg(
+            long,
+            required_unless_present = "interface",
+            conflicts_with = "interface"
+        )]
+        bind: Option<std::net::IpAddr>,
+        /// Listen on the IPv4 address of this interface (e.g. the hotspot AP)
         #[arg(long)]
-        expected_bytes: Option<u64>,
-        /// Expected source SHA-256; required for verified acquisition status
-        #[arg(long, value_parser = receive::parse_hash)]
+        interface: Option<String>,
+        /// Exact source size in bytes (sender: blockdev --getsize64 <device>)
+        #[arg(long)]
+        expected_bytes: u64,
+        /// Expected source SHA-256, known before the transfer
+        #[arg(
+            long,
+            value_parser = receive::parse_hash,
+            required_unless_present = "prompt_sha256",
+            conflicts_with = "prompt_sha256"
+        )]
         expected_sha256: Option<String>,
+        /// Read the sender's SHA-256 from stdin once the transfer has finished
+        #[arg(long)]
+        prompt_sha256: bool,
+        /// Accept streams only from this sender address (repeatable)
+        #[arg(long = "allow-peer")]
+        allow_peer: Vec<std::net::IpAddr>,
         /// Abort if the sender stalls for this many seconds
         #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
@@ -527,6 +545,8 @@ fn start_hotspot_with_routing(
     if let Some(old) = old_device {
         teardown_routing(&old, None)?;
     }
+    // NetworkManager sharing switches on global IPv4 forwarding; remember what it was.
+    routing::remember_ip_forwarding(iface)?;
     // IPv4 and IPv6 guards must exist before NetworkManager activates sharing.
     enable_isolated_routing(iface)?;
     let result = (|| -> Result<String> {
@@ -543,9 +563,27 @@ fn start_hotspot_with_routing(
         ))?;
         teardown_routing(iface, uplink.as_deref())
             .context(format!("{error:#}; rollback cleanup failed"))?;
+        restore_after_hotspot(iface)
+            .context(format!("{error:#}; rollback could not restore forwarding"))?;
         return Err(error);
     }
     result
+}
+
+/// After the AP is down: drop a leftover NetworkManager sharing table and put
+/// net.ipv4.ip_forward back to its pre-hotspot value.
+fn restore_after_hotspot(iface: &str) -> Result<String> {
+    let mut notes = vec![routing::restore_ip_forwarding()?];
+    if !iface.is_empty() {
+        match routing::remove_stale_nm_shared_table(iface) {
+            Ok(Some(note)) => notes.push(note),
+            Ok(None) => {}
+            Err(e) => notes.push(format!(
+                "Warning: could not check for a leftover NetworkManager nftables table: {e:#}"
+            )),
+        }
+    }
+    Ok(notes.join(" "))
 }
 
 fn stop_hotspot_with_routing(iface: &str, uplink: Option<&str>) -> Result<String> {
@@ -557,8 +595,80 @@ fn stop_hotspot_with_routing(iface: &str, uplink: Option<&str>) -> Result<String
         );
     }
     let msg = stop_hotspot(Some(iface))?;
-    teardown_routing(active.as_deref().unwrap_or(iface), uplink)?;
-    Ok(format!("{} Owned firewall rules removed.", msg))
+    let ap = active.as_deref().unwrap_or(iface);
+    teardown_routing(ap, uplink)?;
+    let restored = restore_after_hotspot(ap)?;
+    Ok(format!(
+        "{} Owned firewall rules removed. {}",
+        msg, restored
+    ))
+}
+
+/// Ask for everything `dfnet receive` requires and return its arguments.
+fn prompt_receive_args(
+    input: &mut impl io::BufRead,
+    output: &mut impl io::Write,
+    interfaces: &[NetInterface],
+) -> Result<Vec<String>> {
+    writeln!(output, "Network disk stream receiver. Local addresses:")?;
+    for iface in interfaces.iter().filter(|i| i.name != "lo" && i.ip != "-") {
+        writeln!(output, "  {:<12} {}", iface.name, iface.ip)?;
+    }
+    let mut ask = |question: &str| -> Result<String> {
+        write!(output, "{question}")?;
+        output.flush()?;
+        let mut line = String::new();
+        anyhow::ensure!(
+            input.read_line(&mut line)? > 0,
+            "Input closed; reception cancelled"
+        );
+        Ok(line.trim().to_string())
+    };
+
+    let mut args = vec!["receive".to_string(), "9999".to_string()];
+    let listen = ask("Listen on (interface name or local IP address): ")?;
+    if let Ok(ip) = listen.parse::<std::net::IpAddr>() {
+        receive::validate_bind(ip)?;
+        args.extend(["--bind".into(), ip.to_string()]);
+    } else {
+        routing::validate_interface(&listen)?;
+        args.extend(["--interface".into(), listen]);
+    }
+
+    let size = ask("Exact source size in bytes (sender: blockdev --getsize64 <device>): ")?;
+    let size: u64 = size
+        .parse()
+        .ok()
+        .filter(|n| *n > 0)
+        .context("The source size must be a positive number of bytes")?;
+    args.extend(["--expected-bytes".into(), size.to_string()]);
+
+    let peer = ask("Sender IP address to accept (blank = first sender): ")?;
+    if !peer.is_empty() {
+        let peer: std::net::IpAddr = peer.parse().context("Invalid sender IP address")?;
+        args.extend(["--allow-peer".into(), peer.to_string()]);
+    }
+
+    let hash = ask("Source SHA-256 if already known (blank = enter it after the transfer): ")?;
+    if hash.is_empty() {
+        args.push("--prompt-sha256".into());
+    } else {
+        args.extend([
+            "--expected-sha256".into(),
+            receive::parse_hash(&hash).map_err(anyhow::Error::msg)?,
+        ]);
+    }
+
+    let out = ask("Output image [/media/target/network_stream.raw]: ")?;
+    args.insert(
+        2,
+        if out.is_empty() {
+            "/media/target/network_stream.raw".into()
+        } else {
+            out
+        },
+    );
+    Ok(args)
 }
 
 struct HotspotSnapshot {
@@ -837,13 +947,14 @@ fn run_tui() -> Result<()> {
                             Span::styled("Live Network Disk Stream Receiver", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                         ]),
                         Line::from(""),
-                        Line::from("Listens on TCP port 9999 and streams incoming raw disk stream to:"),
-                        Line::from(Span::styled("  /media/target/network_stream.raw", Style::default().fg(Color::Yellow))),
+                        Line::from("Listens on TCP port 9999 on one chosen address and verifies every stream"),
+                        Line::from("against the exact source size and SHA-256 before it counts as evidence."),
                         Line::from(""),
-                        Line::from("Remote Evidence Command (with live SHA-256 hash):"),
-                        Line::from(Span::styled("  sudo dd if=/dev/nvme0n1 bs=64K status=progress | tee >(sha256sum > source.sha256) | nc <this-ip> 9999", Style::default().fg(Color::Green))),
+                        Line::from("On the sender, note the size first, then stream and hash in one pass:"),
+                        Line::from(Span::styled("  sudo blockdev --getsize64 /dev/nvme0n1", Style::default().fg(Color::Green))),
+                        Line::from(Span::styled("  sudo dd if=/dev/nvme0n1 bs=64K status=progress | tee >(sha256sum > source.sha256) | nc -N <this-ip> 9999", Style::default().fg(Color::Green))),
                         Line::from(""),
-                        Line::from("Press [L] to start listening now."),
+                        Line::from("Press [L] to enter address, size, sender and output, then start listening."),
                     ];
                     let p = Paragraph::new(stream_info)
                         .block(Block::default().borders(Borders::ALL).title(" Live Disk Receiver ").border_style(Style::default().fg(Color::DarkGray)));
@@ -1865,10 +1976,17 @@ fn run_tui() -> Result<()> {
                                 LeaveAlternateScreen,
                                 DisableMouseCapture
                             )?;
-                            println!("Listening on port 9999 for incoming raw disk stream...");
-                            let received = Command::new(std::env::current_exe()?)
-                                .args(["receive"])
-                                .status();
+                            let received = prompt_receive_args(
+                                &mut io::stdin().lock(),
+                                &mut io::stdout(),
+                                &fetch_interfaces(),
+                            )
+                            .and_then(|args| {
+                                Ok(Command::new(std::env::current_exe()?).args(args).status()?)
+                            });
+                            if let Err(e) = &received {
+                                println!("[!] {e:#}");
+                            }
                             is_error = !matches!(&received, Ok(status) if status.success());
                             status_msg = if is_error {
                                 "Reception failed; review the partial image and manifest."
@@ -1978,17 +2096,39 @@ fn main() -> Result<()> {
             port,
             out,
             bind,
+            interface,
             expected_bytes,
             expected_sha256,
+            prompt_sha256: _,
+            allow_peer,
             timeout,
         }) => {
             let outfile = out.unwrap_or_else(|| "/media/target/network_stream.raw".to_string());
+            let bind = match (bind, interface) {
+                (Some(bind), _) => bind,
+                (None, Some(iface)) => std::net::IpAddr::V4(routing::interface_ipv4(&iface)?.0),
+                (None, None) => unreachable!("clap requires --bind or --interface"),
+            };
+            let mut ask = || -> Result<String> {
+                use std::io::BufRead;
+                let mut line = String::new();
+                anyhow::ensure!(
+                    io::stdin().lock().read_line(&mut line)? > 0,
+                    "stdin closed before a hash was entered"
+                );
+                Ok(line)
+            };
+            let expected_hash = match expected_sha256.as_deref() {
+                Some(hash) => receive::ExpectedHash::Given(hash),
+                None => receive::ExpectedHash::AfterTransfer(&mut ask),
+            };
             receive::receive(receive::Options {
                 bind,
                 port: port.unwrap_or(9999),
                 output: std::path::Path::new(&outfile),
                 expected_bytes,
-                expected_sha256: expected_sha256.as_deref(),
+                expected_hash,
+                allowed_peers: &allow_peer,
                 timeout: Duration::from_secs(timeout),
             })?;
         }
@@ -2154,6 +2294,126 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod main_tests {
     use super::*;
+
+    fn iface(name: &str, ip: &str) -> NetInterface {
+        NetInterface {
+            name: name.into(),
+            state: "UP".into(),
+            mac: "-".into(),
+            ip: ip.into(),
+        }
+    }
+
+    fn prompted(answers: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        prompt_receive_args(
+            &mut answers.as_bytes(),
+            &mut out,
+            &[iface("lo", "127.0.0.1/8"), iface("wlan0", "10.42.0.1/24")],
+        )
+    }
+
+    #[test]
+    fn receiver_prompt_builds_a_verified_receive() {
+        let args = prompted("wlan0\n1000\n10.42.0.23\n\n/media/target/case1.raw\n").unwrap();
+        assert_eq!(
+            args,
+            [
+                "receive",
+                "9999",
+                "/media/target/case1.raw",
+                "--interface",
+                "wlan0",
+                "--expected-bytes",
+                "1000",
+                "--allow-peer",
+                "10.42.0.23",
+                "--prompt-sha256"
+            ]
+        );
+        let hash = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+        let args = prompted(&format!("10.42.0.1\n3\n\n{hash}\n\n")).unwrap();
+        assert_eq!(
+            args,
+            [
+                "receive",
+                "9999",
+                "/media/target/network_stream.raw",
+                "--bind",
+                "10.42.0.1",
+                "--expected-bytes",
+                "3",
+                "--expected-sha256",
+                &hash.to_ascii_lowercase()
+            ]
+        );
+        // The produced arguments are accepted by the CLI parser
+        assert!(Cli::try_parse_from(std::iter::once("dfnet".to_string()).chain(args)).is_ok());
+    }
+
+    #[test]
+    fn receiver_prompt_rejects_unsafe_or_missing_answers() {
+        assert!(prompted("0.0.0.0\n1000\n\n\n\n").is_err());
+        assert!(prompted("wlan0\n0\n\n\n\n").is_err());
+        assert!(prompted("wlan0\nlots\n\n\n\n").is_err());
+        assert!(prompted("wlan0\n1000\nnot-an-ip\n\n\n").is_err());
+        assert!(prompted("wlan0\n1000\n\nabc\n\n").is_err());
+        assert!(prompted("wlan0\n").is_err());
+    }
+
+    #[test]
+    fn receive_cli_requires_bind_size_and_hash_source() {
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(
+                ["dfnet", "receive", "9999", "/tmp/x.raw"]
+                    .iter()
+                    .chain(extra),
+            )
+        };
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(parse(&[
+            "--bind",
+            "127.0.0.1",
+            "--expected-bytes",
+            "3",
+            "--expected-sha256",
+            hash
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "--interface",
+            "wlan0",
+            "--expected-bytes",
+            "3",
+            "--prompt-sha256"
+        ])
+        .is_ok());
+        // Missing bind, size or hash source
+        assert!(parse(&["--expected-bytes", "3", "--prompt-sha256"]).is_err());
+        assert!(parse(&["--bind", "127.0.0.1", "--prompt-sha256"]).is_err());
+        assert!(parse(&["--bind", "127.0.0.1", "--expected-bytes", "3"]).is_err());
+        // Contradictory options
+        assert!(parse(&[
+            "--bind",
+            "127.0.0.1",
+            "--interface",
+            "wlan0",
+            "--expected-bytes",
+            "3",
+            "--prompt-sha256"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "--bind",
+            "127.0.0.1",
+            "--expected-bytes",
+            "3",
+            "--prompt-sha256",
+            "--expected-sha256",
+            hash
+        ])
+        .is_err());
+    }
 
     #[test]
     fn test_cli_parsing_hotspot_options() {

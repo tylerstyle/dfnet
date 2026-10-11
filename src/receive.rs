@@ -12,23 +12,57 @@ use std::{
 #[derive(Serialize)]
 struct Manifest {
     status: &'static str,
+    bind: String,
     peer: String,
+    allowed_peers: Vec<String>,
+    rejected_peers: Vec<String>,
     bytes: u64,
     sha256: String,
     started_unix: u64,
     finished_unix: u64,
-    expected_bytes: Option<u64>,
+    expected_bytes: u64,
     expected_sha256: Option<String>,
+    expected_sha256_source: &'static str,
     error: Option<String>,
+}
+
+/// Where the source hash the stream is checked against comes from.
+pub enum ExpectedHash<'a> {
+    /// Known before the transfer (`--expected-sha256`)
+    Given(&'a str),
+    /// Entered after the transfer, e.g. from the sender's `tee >(sha256sum)`, so the
+    /// source is read only once. The receiver's own hash is not shown before entry.
+    AfterTransfer(&'a mut dyn FnMut() -> Result<String>),
 }
 
 pub struct Options<'a> {
     pub bind: IpAddr,
     pub port: u16,
     pub output: &'a Path,
-    pub expected_bytes: Option<u64>,
-    pub expected_sha256: Option<&'a str>,
+    pub expected_bytes: u64,
+    pub expected_hash: ExpectedHash<'a>,
+    /// Accept only these senders; empty accepts the first connection
+    pub allowed_peers: &'a [IpAddr],
     pub timeout: Duration,
+}
+
+/// The receiver must listen on one concrete local address, never on all interfaces.
+pub fn validate_bind(addr: IpAddr) -> Result<()> {
+    anyhow::ensure!(
+        !addr.is_unspecified(),
+        "Refusing to listen on all interfaces ({addr}); pass --bind <local address> or --interface <name>"
+    );
+    anyhow::ensure!(
+        !addr.is_multicast(),
+        "Cannot listen on multicast address {addr}"
+    );
+    if let IpAddr::V4(v4) = addr {
+        anyhow::ensure!(
+            !v4.is_broadcast(),
+            "Cannot listen on broadcast address {addr}"
+        );
+    }
+    Ok(())
 }
 
 fn create_new(path: &Path) -> Result<File> {
@@ -108,6 +142,14 @@ fn copy_stream(
     Ok(())
 }
 
+fn peer_allowed(allowed: &[IpAddr], peer: IpAddr) -> bool {
+    let canonical = |ip: IpAddr| match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+    allowed.is_empty() || allowed.iter().any(|a| canonical(*a) == canonical(peer))
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -116,11 +158,23 @@ fn now() -> u64 {
 }
 
 pub fn receive(options: Options<'_>) -> Result<()> {
-    let expected_hash = options
-        .expected_sha256
-        .map(parse_hash)
-        .transpose()
-        .map_err(anyhow::Error::msg)?;
+    validate_bind(options.bind)?;
+    anyhow::ensure!(
+        options.expected_bytes > 0,
+        "Expected byte count must be positive"
+    );
+    let mut expected_hash = match &options.expected_hash {
+        ExpectedHash::Given(hash) => Some(parse_hash(hash).map_err(anyhow::Error::msg)?),
+        ExpectedHash::AfterTransfer(_) => None,
+    };
+    let expected_hash_source = match &options.expected_hash {
+        ExpectedHash::Given(_) => "argument",
+        ExpectedHash::AfterTransfer(_) => "entered_after_transfer",
+    };
+    let mut ask_hash = match options.expected_hash {
+        ExpectedHash::AfterTransfer(ask) => Some(ask),
+        ExpectedHash::Given(_) => None,
+    };
     let mut checksum_path = options.output.as_os_str().to_os_string();
     checksum_path.push(".sha256");
     let mut manifest_path = options.output.as_os_str().to_os_string();
@@ -153,13 +207,21 @@ pub fn receive(options: Options<'_>) -> Result<()> {
     // Persist a pending record before accepting data; interruption cannot look successful.
     let mut manifest = Manifest {
         status: "incomplete",
+        bind: listener.local_addr()?.to_string(),
         peer: String::new(),
+        allowed_peers: options
+            .allowed_peers
+            .iter()
+            .map(|p| p.to_string())
+            .collect(),
+        rejected_peers: Vec::new(),
         bytes: 0,
         sha256: String::new(),
         started_unix: started,
         finished_unix: 0,
         expected_bytes: options.expected_bytes,
         expected_sha256: expected_hash.clone(),
+        expected_sha256_source: expected_hash_source,
         error: Some("Transfer has not completed".into()),
     };
     serde_json::to_writer_pretty(&mut manifest_file, &manifest)?;
@@ -169,10 +231,25 @@ pub fn receive(options: Options<'_>) -> Result<()> {
         listener.local_addr()?,
         options.output.display()
     );
-    println!("[*] Raw TCP is unauthenticated. Use a trusted acquisition network.");
+    if options.allowed_peers.is_empty() {
+        println!("[*] Raw TCP is unauthenticated: the first sender is accepted; the SHA-256 check decides validity.");
+    } else {
+        println!(
+            "[*] Accepting only {}; other senders are rejected and logged.",
+            manifest.allowed_peers.join(", ")
+        );
+    }
     let mut hash = Sha256::new();
     let result = (|| -> Result<()> {
-        let (mut stream, peer) = listener.accept().context("Cannot accept stream")?;
+        let (mut stream, peer) = loop {
+            let (stream, peer) = listener.accept().context("Cannot accept stream")?;
+            if peer_allowed(options.allowed_peers, peer.ip()) {
+                break (stream, peer);
+            }
+            eprintln!("[!] Rejected connection from {peer}: not an allowed sender");
+            manifest.rejected_peers.push(peer.to_string());
+            drop(stream);
+        };
         drop(listener); // A single sender per acquisition.
         manifest.peer = peer.to_string();
         stream.set_read_timeout(Some(options.timeout))?;
@@ -181,28 +258,34 @@ pub fn receive(options: Options<'_>) -> Result<()> {
             &mut output,
             &mut manifest.bytes,
             &mut hash,
-            options.expected_bytes,
+            Some(options.expected_bytes),
         )?;
         output.sync_all().context("Cannot flush image to storage")?;
         Ok(())
     })();
-    manifest.sha256 = format!("{:x}", hash.finalize());
-    manifest.finished_unix = now();
+    let received_hash = format!("{:x}", hash.finalize());
     let result = result.and_then(|()| {
-        if expected_hash
-            .as_ref()
-            .is_some_and(|expected| expected != &manifest.sha256)
-        {
-            bail!("SHA-256 does not match the expected source hash");
+        if let Some(ask) = ask_hash.as_mut() {
+            println!(
+                "[*] Received {} bytes. Enter the SHA-256 reported by the sender:",
+                manifest.bytes
+            );
+            let entered = ask().context("No expected SHA-256 entered")?;
+            expected_hash = Some(parse_hash(entered.trim()).map_err(anyhow::Error::msg)?);
+            manifest.expected_sha256 = expected_hash.clone();
         }
-        Ok(())
+        match &expected_hash {
+            Some(expected) if expected == &received_hash => Ok(()),
+            Some(_) => bail!("SHA-256 does not match the expected source hash"),
+            None => bail!("No expected SHA-256 available"),
+        }
     });
+    manifest.sha256 = received_hash;
+    manifest.finished_unix = now();
     manifest.status = if result.is_err() {
         "incomplete"
-    } else if expected_hash.is_some() {
-        "verified"
     } else {
-        "received_unverified"
+        "verified"
     };
     manifest.error = result.as_ref().err().map(|e| format!("{e:#}"));
     if result.is_ok() {
@@ -281,6 +364,27 @@ mod tests {
             .is_err());
         }
     }
+    #[test]
+    fn refuses_wildcard_and_non_unicast_binds() {
+        for addr in ["0.0.0.0", "::", "255.255.255.255", "224.0.0.1", "ff02::1"] {
+            assert!(validate_bind(addr.parse().unwrap()).is_err(), "{addr}");
+        }
+        for addr in ["127.0.0.1", "10.42.0.1", "::1", "fe80::1"] {
+            assert!(validate_bind(addr.parse().unwrap()).is_ok(), "{addr}");
+        }
+    }
+
+    #[test]
+    fn peer_allowlist() {
+        let a: IpAddr = "10.42.0.23".parse().unwrap();
+        let b: IpAddr = "10.42.0.99".parse().unwrap();
+        assert!(peer_allowed(&[], b));
+        assert!(peer_allowed(&[a], a));
+        assert!(!peer_allowed(&[a], b));
+        // A dual-stack listener reports IPv4 senders as v4-mapped IPv6
+        assert!(peer_allowed(&[a], "::ffff:10.42.0.23".parse().unwrap()));
+    }
+
     #[test]
     fn propagates_storage_failure() {
         struct FullDisk;

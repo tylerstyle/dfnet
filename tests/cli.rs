@@ -33,7 +33,8 @@ impl Fixture {
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
-            .env("TEST_DIR", &self.0);
+            .env("TEST_DIR", &self.0)
+            .env("DFNET_STATE_DIR", self.0.join("state"));
         command
     }
     fn script(&self, name: &str, body: &str) {
@@ -75,6 +76,60 @@ printf 'ip %s\n' "$*" >> "$TEST_DIR/log"
 if [[ "$*" == 'route show default' ]]; then echo 'default via 192.0.2.1 dev eth0'; fi
 "#,
         );
+        // Kernel forwarding switch, stored in a file (default off)
+        self.script(
+            "sysctl",
+            r#"
+printf 'sysctl %s\n' "$*" >> "$TEST_DIR/log"
+f="$TEST_DIR/ip_forward"; [[ -f "$f" ]] || echo 0 > "$f"
+case "$1" in -n) cat "$f";; -w) echo "${2#*=}" > "$f";; esac
+"#,
+        );
+        self.script(
+            "nft",
+            r#"
+printf 'nft %s\n' "$*" >> "$TEST_DIR/log"
+case "$*" in
+    'list tables') if [[ -f "$TEST_DIR/nmtable" ]]; then echo 'table ip nm-shared-wlan0'; fi;;
+    'delete table ip nm-shared-wlan0') rm "$TEST_DIR/nmtable";;
+esac
+"#,
+        );
+    }
+    /// NetworkManager that, like the real one, enables global forwarding and an
+    /// nftables table for a shared AP and leaves both behind when it goes down.
+    fn network_manager(&self, other_shared: bool) {
+        self.firewall();
+        if other_shared {
+            fs::write(self.0.join("other_shared"), "").unwrap();
+        }
+        self.script(
+            "nmcli",
+            r#"
+printf 'nmcli %s\n' "$*" >> "$TEST_DIR/log"
+case "$*" in
+    'connection add '*) touch "$TEST_DIR/profile";;
+    'connection up id dfnet-hotspot')
+        touch "$TEST_DIR/active" "$TEST_DIR/nmtable"; echo 1 > "$TEST_DIR/ip_forward"
+        if [[ -f "$TEST_DIR/fail_up" ]]; then exit 1; fi;;
+    'connection down id dfnet-hotspot') rm -f "$TEST_DIR/active";;
+    'connection delete id dfnet-hotspot') rm -f "$TEST_DIR/profile";;
+    '-g NAME connection show') if [[ -f "$TEST_DIR/profile" ]]; then echo dfnet-hotspot; fi;;
+    '-t -f NAME,DEVICE connection show --active')
+        if [[ -f "$TEST_DIR/active" ]]; then echo 'dfnet-hotspot:wlan0'; fi;;
+    '-t -f NAME,UUID connection show --active')
+        if [[ -f "$TEST_DIR/active" ]]; then echo 'dfnet-hotspot:1111'; fi
+        if [[ -f "$TEST_DIR/other_shared" ]]; then echo 'Lab-Share:2222'; fi;;
+    '-g ipv4.method connection show 2222') echo shared;;
+esac
+"#,
+        );
+    }
+    fn ip_forward(&self) -> String {
+        fs::read_to_string(self.0.join("ip_forward"))
+            .unwrap()
+            .trim()
+            .to_string()
     }
 }
 impl Drop for Fixture {
@@ -104,6 +159,8 @@ impl Drop for Process {
         let _ = self.0.wait();
     }
 }
+
+const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 fn transfer(data: &[u8], extra: &[&str]) -> (Fixture, bool, serde_json::Value) {
     let fixture = Fixture::new();
@@ -151,13 +208,12 @@ fn receives_and_verifies_a_real_tcp_stream() {
 }
 
 #[test]
-fn distinguishes_unverified_truncated_and_mismatched_images() {
-    let (_, ok, manifest) = transfer(b"abc", &[]);
-    assert!(ok);
-    assert_eq!(manifest["status"], "received_unverified");
+fn distinguishes_truncated_and_mismatched_images() {
     for args in [
-        vec!["--expected-bytes", "4"],
+        vec!["--expected-bytes", "4", "--expected-sha256", ABC_SHA256],
         vec![
+            "--expected-bytes",
+            "3",
             "--expected-sha256",
             "0000000000000000000000000000000000000000000000000000000000000000",
         ],
@@ -186,6 +242,10 @@ fn refuses_existing_images_and_symlinks() {
             path.to_str().unwrap(),
             "--bind",
             "127.0.0.1",
+            "--expected-bytes",
+            "3",
+            "--expected-sha256",
+            ABC_SHA256,
         ]);
         assert!(!result.status.success());
         assert_eq!(fs::read(&out).unwrap(), b"original evidence");
@@ -351,6 +411,10 @@ fn sender_idle_timeout_keeps_an_incomplete_manifest() {
                 out.to_str().unwrap(),
                 "--bind",
                 "127.0.0.1",
+                "--expected-bytes",
+                "3",
+                "--expected-sha256",
+                ABC_SHA256,
                 "--timeout",
                 "1",
             ])
@@ -379,7 +443,17 @@ fn existing_sidecars_do_not_create_a_new_image() {
     let out = fixture.0.join("image.raw");
     fs::write(fixture.0.join("image.raw.sha256"), "original hash").unwrap();
     assert!(!fixture
-        .run(&["receive", "0", out.to_str().unwrap()])
+        .run(&[
+            "receive",
+            "0",
+            out.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1",
+            "--expected-bytes",
+            "3",
+            "--expected-sha256",
+            ABC_SHA256
+        ])
         .status
         .success());
     assert!(!out.exists());
@@ -456,4 +530,262 @@ esac
     assert!(String::from_utf8_lossy(&result.stderr).contains("guards retained"));
     let log = fs::read_to_string(fixture.0.join("log")).unwrap();
     assert!(!log.contains(" -D "));
+}
+
+// ---------------------------------------------------------------------------
+// Receiver: bind, size, hash and sender requirements
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_to_listen_without_address_size_or_hash_or_on_all_interfaces() {
+    let fixture = Fixture::new();
+    let out = fixture.0.join("image.raw");
+    let out = out.to_str().unwrap();
+    let base = ["receive", "0", out];
+    for extra in [
+        vec!["--expected-bytes", "3", "--expected-sha256", ABC_SHA256],
+        vec!["--bind", "127.0.0.1", "--expected-sha256", ABC_SHA256],
+        vec!["--bind", "127.0.0.1", "--expected-bytes", "3"],
+        vec![
+            "--bind",
+            "0.0.0.0",
+            "--expected-bytes",
+            "3",
+            "--expected-sha256",
+            ABC_SHA256,
+        ],
+        vec!["--bind", "::", "--expected-bytes", "3", "--prompt-sha256"],
+        vec![
+            "--bind",
+            "127.0.0.1",
+            "--expected-bytes",
+            "0",
+            "--prompt-sha256",
+        ],
+    ] {
+        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+        let result = fixture.run(&args);
+        assert!(!result.status.success(), "{extra:?}");
+        assert!(!fixture.0.join("image.raw").exists(), "{extra:?}");
+        assert!(!fixture.0.join("image.raw.json").exists(), "{extra:?}");
+    }
+}
+
+fn prompted_transfer(entered: &str) -> (Fixture, bool, String, serde_json::Value) {
+    let fixture = Fixture::new();
+    let out = fixture.0.join("image.raw");
+    let mut process = Process(
+        fixture
+            .command()
+            .args([
+                "receive",
+                "0",
+                out.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1",
+                "--expected-bytes",
+                "3",
+                "--prompt-sha256",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut reader = BufReader::new(process.0.stdout.take().unwrap());
+    let mut transcript = String::new();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let address = line.split_whitespace().nth(3).unwrap().to_string();
+    transcript.push_str(&line);
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream.write_all(b"abc").unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    // Read up to the prompt before answering it
+    loop {
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "receiver exited before prompting"
+        );
+        transcript.push_str(&line);
+        if line.contains("Enter the SHA-256 reported by the sender") {
+            break;
+        }
+    }
+    let mut stdin = process.0.stdin.take().unwrap();
+    stdin.write_all(entered.as_bytes()).unwrap();
+    drop(stdin);
+    let ok = process.finish().success();
+    let manifest =
+        serde_json::from_slice(&fs::read(fixture.0.join("image.raw.json")).unwrap()).unwrap();
+    (fixture, ok, transcript, manifest)
+}
+
+#[test]
+fn hash_entered_after_transfer_verifies_without_revealing_the_received_hash() {
+    let (_fixture, ok, transcript, manifest) =
+        prompted_transfer(&format!("{}\n", ABC_SHA256.to_uppercase()));
+    assert!(ok);
+    assert!(!transcript.contains(ABC_SHA256), "{transcript}");
+    assert_eq!(manifest["status"], "verified");
+    assert_eq!(manifest["expected_sha256"], ABC_SHA256);
+    assert_eq!(manifest["expected_sha256_source"], "entered_after_transfer");
+}
+
+#[test]
+fn wrong_or_missing_hash_after_transfer_is_incomplete() {
+    for entered in [
+        "0000000000000000000000000000000000000000000000000000000000000000\n",
+        "",
+        "not a hash\n",
+    ] {
+        let (fixture, ok, _, manifest) = prompted_transfer(entered);
+        assert!(!ok, "{entered:?}");
+        assert_eq!(manifest["status"], "incomplete", "{entered:?}");
+        assert!(fs::read(fixture.0.join("image.raw.sha256"))
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn rejected_senders_do_not_consume_the_single_connection() {
+    let fixture = Fixture::new();
+    let out = fixture.0.join("image.raw");
+    let mut process = Process(
+        fixture
+            .command()
+            .args([
+                "receive",
+                "0",
+                out.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1",
+                "--expected-bytes",
+                "3",
+                "--expected-sha256",
+                ABC_SHA256,
+                "--allow-peer",
+                "192.0.2.10",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut reader = BufReader::new(process.0.stdout.take().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let address = line.split_whitespace().nth(3).unwrap().to_string();
+
+    let mut errors = BufReader::new(process.0.stderr.take().unwrap());
+    for _ in 0..2 {
+        let mut rogue = TcpStream::connect(&address).unwrap();
+        let _ = rogue.write_all(b"xyz");
+        let mut err = String::new();
+        errors.read_line(&mut err).unwrap();
+        assert!(err.contains("Rejected connection from 127.0.0.1"), "{err}");
+    }
+    // Still listening, nothing written
+    assert!(process.0.try_wait().unwrap().is_none());
+    assert_eq!(fs::read(&out).unwrap(), b"");
+}
+
+// ---------------------------------------------------------------------------
+// Hotspot: forwarding and NetworkManager leftovers are cleaned up
+// ---------------------------------------------------------------------------
+
+fn start_ap(fixture: &Fixture) -> Output {
+    fixture.run(&[
+        "hotspot",
+        "start",
+        "--iface",
+        "wlan0",
+        "--password",
+        "test-passphrase",
+    ])
+}
+
+#[test]
+fn stopping_the_hotspot_restores_disabled_forwarding_and_drops_nm_table() {
+    let fixture = Fixture::new();
+    fixture.network_manager(false);
+    let started = start_ap(&fixture);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert_eq!(
+        fixture.ip_forward(),
+        "1",
+        "NetworkManager sharing turned forwarding on"
+    );
+    assert!(fixture.0.join("state/ip_forward.json").exists());
+
+    let stopped = fixture.run(&["hotspot", "stop", "--iface", "wlan0"]);
+    let stdout = String::from_utf8_lossy(&stopped.stdout);
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert_eq!(fixture.ip_forward(), "0");
+    assert!(stdout.contains("restored to disabled"), "{stdout}");
+    assert!(!fixture.0.join("nmtable").exists());
+    assert!(!fixture.0.join("state/ip_forward.json").exists());
+    let log = fs::read_to_string(fixture.0.join("log")).unwrap();
+    assert!(log.contains("sysctl -w net.ipv4.ip_forward=0"));
+    assert!(log.find("nmcli connection down").unwrap() < log.find("sysctl -w").unwrap());
+}
+
+#[test]
+fn forwarding_enabled_before_the_hotspot_stays_enabled() {
+    let fixture = Fixture::new();
+    fixture.network_manager(false);
+    fs::write(fixture.0.join("ip_forward"), "1\n").unwrap();
+    assert!(start_ap(&fixture).status.success());
+    let stopped = fixture.run(&["hotspot", "stop", "--iface", "wlan0"]);
+    assert!(stopped.status.success());
+    assert_eq!(fixture.ip_forward(), "1");
+    assert!(String::from_utf8_lossy(&stopped.stdout).contains("already enabled"));
+    let log = fs::read_to_string(fixture.0.join("log")).unwrap();
+    assert!(!log.contains("sysctl -w"));
+}
+
+#[test]
+fn forwarding_stays_on_while_another_shared_connection_needs_it() {
+    let fixture = Fixture::new();
+    fixture.network_manager(true);
+    assert!(start_ap(&fixture).status.success());
+    let stopped = fixture.run(&["hotspot", "stop", "--iface", "wlan0"]);
+    assert!(stopped.status.success());
+    assert_eq!(fixture.ip_forward(), "1");
+    assert!(String::from_utf8_lossy(&stopped.stdout).contains("Lab-Share"));
+    assert!(!fixture.0.join("state/ip_forward.json").exists());
+}
+
+#[test]
+fn restarting_the_hotspot_keeps_the_original_forwarding_state() {
+    let fixture = Fixture::new();
+    fixture.network_manager(false);
+    assert!(start_ap(&fixture).status.success());
+    assert_eq!(fixture.ip_forward(), "1");
+    // Second start sees forwarding already on, but must not record that as original
+    assert!(start_ap(&fixture).status.success());
+    assert!(fixture.run(&["hotspot", "stop"]).status.success());
+    assert_eq!(fixture.ip_forward(), "0");
+}
+
+#[test]
+fn failed_activation_rolls_back_forwarding() {
+    let fixture = Fixture::new();
+    fixture.network_manager(false);
+    fs::write(fixture.0.join("fail_up"), "").unwrap();
+    let result = start_ap(&fixture);
+    assert!(!result.status.success());
+    assert_eq!(fixture.ip_forward(), "0");
+    assert!(!fixture.0.join("state/ip_forward.json").exists());
 }

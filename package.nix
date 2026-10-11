@@ -10,6 +10,7 @@
 , util-linux
 , iptables
 , procps
+, nftables
 }:
 
 rustPlatform.buildRustPackage {
@@ -43,6 +44,7 @@ rustPlatform.buildRustPackage {
         util-linux
         iptables
         procps
+        nftables
       ]}
 
     wrapProgram $out/bin/dfnet-cli \
@@ -57,6 +59,7 @@ rustPlatform.buildRustPackage {
         util-linux
         iptables
         procps
+        nftables
       ]}
 
     # Desktop entry
