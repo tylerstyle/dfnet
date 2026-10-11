@@ -1,5 +1,6 @@
 { lib
 , rustPlatform
+, runCommand
 , makeWrapper
 , macchanger
 , networkmanager
@@ -11,13 +12,29 @@
 , iptables
 , procps
 , nftables
+  # dfcore is a sibling path dependency (../dfcore); flakes pass their input
+, dfcoreSrc ? ../dfcore
 }:
 
+let
+  clean = src: lib.cleanSourceWith {
+    filter = path: type: baseNameOf path != "target";
+    src = lib.cleanSource src;
+  };
+  # Lay out the sources as in ~/git so `path = "../dfcore"` resolves
+  src = runCommand "dfnet-src" { } ''
+    mkdir -p $out
+    cp -r ${clean ./.} $out/dfnet
+    cp -r ${clean dfcoreSrc} $out/dfcore
+    chmod -R u+w $out
+  '';
+in
 rustPlatform.buildRustPackage {
   pname = "dfnet";
-  version = "0.1.3";
+  version = "0.1.4";
 
-  src = lib.cleanSource ./.;
+  inherit src;
+  sourceRoot = "dfnet-src/dfnet";
 
   cargoLock = {
     lockFile = ./Cargo.lock;

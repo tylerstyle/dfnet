@@ -54,6 +54,15 @@ the sender allowlist is address-based and the hash check is what proves integrit
 use a trusted acquisition network or an authenticated transport/tunnel. A hash
 record does not replace source identification or an examiner's acquisition log.
 
+### Audit trail
+
+Each reception appends `receive_started` and `receive_finished` records to the
+hash-chained dfnix audit log (via [`dfcore`](https://github.com/tylerstyle/dfcore),
+`/run/dfnix/audit.jsonl`). The manifest's `audit_anchor` is the hash of the start
+record; the finish record holds the manifest's SHA-256. Hotspot start and stop are
+recorded with the IPv4 forwarding state before and after; the WPA2 passphrase is
+redacted from the recorded command line.
+
 ## Wi-Fi hotspots and routing
 
 ```bash

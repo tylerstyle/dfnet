@@ -34,7 +34,8 @@ impl Fixture {
                 ),
             )
             .env("TEST_DIR", &self.0)
-            .env("DFNET_STATE_DIR", self.0.join("state"));
+            .env("DFNET_STATE_DIR", self.0.join("state"))
+            .env("DFNIX_AUDIT_LOG", self.0.join("audit.jsonl"));
         command
     }
     fn script(&self, name: &str, body: &str) {
@@ -124,6 +125,16 @@ case "$*" in
 esac
 "#,
         );
+    }
+    /// Audit records after checking that the chain verifies
+    fn audit(&self) -> Vec<serde_json::Value> {
+        let log = self.0.join("audit.jsonl");
+        dfcore::audit::verify(&log).expect("audit chain verifies");
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
     fn ip_forward(&self) -> String {
         fs::read_to_string(self.0.join("ip_forward"))
@@ -788,4 +799,73 @@ fn failed_activation_rolls_back_forwarding() {
     assert!(!result.status.success());
     assert_eq!(fixture.ip_forward(), "0");
     assert!(!fixture.0.join("state/ip_forward.json").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail (dfcore)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reception_and_manifest_anchor_each_other_in_the_audit_log() {
+    let (fixture, ok, manifest) = transfer(
+        b"abc",
+        &["--expected-bytes", "3", "--expected-sha256", ABC_SHA256],
+    );
+    assert!(ok);
+    let records = fixture.audit();
+    let actions: Vec<_> = records
+        .iter()
+        .map(|r| r["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, ["receive_started", "receive_finished"]);
+    assert_eq!(manifest["audit_anchor"], records[0]["hash"]);
+    assert_eq!(records[1]["outcome"], "ok");
+    assert_eq!(records[1]["details"]["sha256"], ABC_SHA256);
+    assert_eq!(records[1]["details"]["status"], "verified");
+    use sha2::Digest;
+    let manifest_bytes = fs::read(fixture.0.join("image.raw.json")).unwrap();
+    assert_eq!(
+        records[1]["details"]["manifest_sha256"],
+        format!("{:x}", sha2::Sha256::digest(&manifest_bytes))
+    );
+}
+
+#[test]
+fn failed_reception_is_recorded_as_error() {
+    let (fixture, ok, _) = transfer(
+        b"abc",
+        &["--expected-bytes", "4", "--expected-sha256", ABC_SHA256],
+    );
+    assert!(!ok);
+    let records = fixture.audit();
+    assert_eq!(records[1]["action"], "receive_finished");
+    assert_eq!(records[1]["outcome"], "error");
+    assert_eq!(records[1]["details"]["status"], "incomplete");
+}
+
+#[test]
+fn hotspot_start_and_stop_are_audited_without_the_password() {
+    let fixture = Fixture::new();
+    fixture.network_manager(false);
+    assert!(start_ap(&fixture).status.success());
+    assert!(fixture
+        .run(&["hotspot", "stop", "--iface", "wlan0"])
+        .status
+        .success());
+    let records = fixture.audit();
+    let actions: Vec<_> = records
+        .iter()
+        .map(|r| {
+            (
+                r["action"].as_str().unwrap(),
+                r["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(actions, [("hotspot_start", "ok"), ("hotspot_stop", "ok")]);
+    assert_eq!(records[0]["details"]["ip_forward_before"], false);
+    assert_eq!(records[0]["details"]["ip_forward_after"], true);
+    assert_eq!(records[1]["details"]["ip_forward_after"], false);
+    let log = fs::read_to_string(fixture.0.join("audit.jsonl")).unwrap();
+    assert!(!log.contains("test-passphrase"));
 }

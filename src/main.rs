@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod audit;
 mod receive;
 mod routing;
 
@@ -529,6 +530,29 @@ fn start_hotspot_with_routing(
     mode: HotspotRoutingMode,
     uplink: Option<&str>,
 ) -> Result<String> {
+    let before = routing::get_ip_forwarding();
+    let result = start_hotspot_with_routing_steps(iface, ssid, password, mode, uplink);
+    // Never the password: the log is evidence and may be handed over
+    audit::record(
+        audit::event("hotspot_start")
+            .result(&result)
+            .detail("iface", iface)
+            .detail("ssid", ssid)
+            .detail("mode", mode.label())
+            .detail("uplink", uplink.map(str::to_string))
+            .detail("ip_forward_before", before)
+            .detail("ip_forward_after", routing::get_ip_forwarding()),
+    );
+    result
+}
+
+fn start_hotspot_with_routing_steps(
+    iface: &str,
+    ssid: &str,
+    password: &str,
+    mode: HotspotRoutingMode,
+    uplink: Option<&str>,
+) -> Result<String> {
     validate_hotspot(iface, ssid, password)?;
     let uplink = if mode == HotspotRoutingMode::NatPassthrough {
         let up = uplink
@@ -587,6 +611,20 @@ fn restore_after_hotspot(iface: &str) -> Result<String> {
 }
 
 fn stop_hotspot_with_routing(iface: &str, uplink: Option<&str>) -> Result<String> {
+    let before = routing::get_ip_forwarding();
+    let result = stop_hotspot_with_routing_steps(iface, uplink);
+    audit::record(
+        audit::event("hotspot_stop")
+            .result(&result)
+            .detail("iface", iface)
+            .detail("ip_forward_before", before)
+            .detail("ip_forward_after", routing::get_ip_forwarding())
+            .detail("summary", result.as_ref().ok().cloned()),
+    );
+    result
+}
+
+fn stop_hotspot_with_routing_steps(iface: &str, uplink: Option<&str>) -> Result<String> {
     let active = managed_hotspot_device()?;
     if let Some(active) = &active {
         anyhow::ensure!(

@@ -1,6 +1,6 @@
 [package]
 name = "dfnet"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Linux network triage, MAC management, read-only shares, verified stream reception and Wi-Fi AP TUI"
@@ -12,6 +12,7 @@ keywords = ["forensics", "dfir", "network", "macchanger", "tui"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+dfcore = { path = "../dfcore" }
 ratatui = "0.30"
 crossterm = "0.29"
 clap = { version = "4.6", features = ["derive", "cargo"] }

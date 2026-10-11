@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+
+use crate::audit;
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -23,6 +25,9 @@ struct Manifest {
     expected_bytes: u64,
     expected_sha256: Option<String>,
     expected_sha256_source: &'static str,
+    /// Hash of the audit-log record written when this reception started; the
+    /// matching "receive_finished" record carries this manifest's SHA-256
+    audit_anchor: Option<String>,
     error: Option<String>,
 }
 
@@ -204,6 +209,22 @@ pub fn receive(options: Options<'_>) -> Result<()> {
     let mut manifest_file = create_new(Path::new(&manifest_path))?;
     let mut checksum_file = create_new(Path::new(&checksum_path))?;
     let started = now();
+    let audit_anchor = audit::record(
+        audit::event("receive_started")
+            .detail("bind", listener.local_addr()?.to_string())
+            .detail("output", options.output.to_string_lossy().to_string())
+            .detail("expected_bytes", options.expected_bytes)
+            .detail("expected_sha256", expected_hash.clone())
+            .detail("expected_sha256_source", expected_hash_source)
+            .detail(
+                "allowed_peers",
+                options
+                    .allowed_peers
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+    );
     // Persist a pending record before accepting data; interruption cannot look successful.
     let mut manifest = Manifest {
         status: "incomplete",
@@ -222,6 +243,7 @@ pub fn receive(options: Options<'_>) -> Result<()> {
         expected_bytes: options.expected_bytes,
         expected_sha256: expected_hash.clone(),
         expected_sha256_source: expected_hash_source,
+        audit_anchor,
         error: Some("Transfer has not completed".into()),
     };
     serde_json::to_writer_pretty(&mut manifest_file, &manifest)?;
@@ -308,8 +330,23 @@ pub fn receive(options: Options<'_>) -> Result<()> {
     use std::io::{Seek, SeekFrom};
     manifest_file.seek(SeekFrom::Start(0))?;
     manifest_file.set_len(0)?;
-    serde_json::to_writer_pretty(&mut manifest_file, &manifest)?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    manifest_file.write_all(&manifest_bytes)?;
     manifest_file.sync_all()?;
+    audit::record(
+        audit::event("receive_finished")
+            .result(&result)
+            .detail("status", manifest.status)
+            .detail("peer", manifest.peer.clone())
+            .detail("rejected_peers", manifest.rejected_peers.clone())
+            .detail("bytes", manifest.bytes)
+            .detail("sha256", manifest.sha256.clone())
+            .detail("output", options.output.to_string_lossy().to_string())
+            .detail(
+                "manifest_sha256",
+                format!("{:x}", Sha256::digest(&manifest_bytes)),
+            ),
+    );
     eprintln!();
     result?;
     println!(
