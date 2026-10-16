@@ -22,9 +22,11 @@ use std::{
 };
 
 mod audit;
+mod listen;
 mod pcap;
 mod receive;
 mod routing;
+mod ssh;
 mod stream;
 
 use routing::{
@@ -171,6 +173,12 @@ enum Commands {
         #[arg(long)]
         allow_tmpfs: bool,
     },
+    /// Temporary SSH access into dfnix with a per-case key (headless
+    /// servers): fresh host key, key-only root login on one address
+    Ssh {
+        #[command(subcommand)]
+        action: SshAction,
+    },
     /// Create, stop, or inspect forensic Wi-Fi Access Point (Hotspot)
     Hotspot {
         #[command(subcommand)]
@@ -181,6 +189,25 @@ enum Commands {
         #[command(subcommand)]
         action: Option<RouteAction>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SshAction {
+    /// Start sshd for the public keys in KEY_FILE, bound to one address
+    Start {
+        /// The examiner's public key(s) for this case (authorized_keys format)
+        #[arg(long)]
+        key: std::path::PathBuf,
+        /// Local address to listen on (never 0.0.0.0 / ::)
+        #[arg(long)]
+        bind: std::net::IpAddr,
+        #[arg(long, default_value = "22")]
+        port: u16,
+    },
+    /// End the session: stop sshd, close the port, delete keys, record logins
+    Stop,
+    /// Show the open session and its logins
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2285,6 +2312,11 @@ fn main() -> Result<()> {
                 std::process::exit(i32::from(code));
             }
         }
+        Some(Commands::Ssh { action }) => match action {
+            SshAction::Start { key, bind, port } => ssh::start(&key, bind, port)?,
+            SshAction::Stop => ssh::stop()?,
+            SshAction::Status => ssh::status()?,
+        },
         Some(Commands::Stream {
             bind,
             port,

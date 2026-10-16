@@ -205,6 +205,7 @@ pub fn receive(options: Options<'_>) -> Result<()> {
     // Bind before creating files, so a busy port cannot leave misleading output.
     let listener =
         TcpListener::bind((options.bind, options.port)).context("Cannot bind receiver")?;
+    let firewall = crate::listen::open_for(listener.local_addr()?, "receive");
     let mut output = create_new(options.output)?;
     let mut manifest_file = create_new(Path::new(&manifest_path))?;
     let mut checksum_file = create_new(Path::new(&checksum_path))?;
@@ -264,7 +265,8 @@ pub fn receive(options: Options<'_>) -> Result<()> {
     let mut hash = Sha256::new();
     let result = (|| -> Result<()> {
         let (mut stream, peer) = loop {
-            let (stream, peer) = listener.accept().context("Cannot accept stream")?;
+            let (stream, peer) =
+                crate::listen::accept(&listener).context("Cannot accept stream")?;
             if peer_allowed(options.allowed_peers, peer.ip()) {
                 break (stream, peer);
             }
@@ -273,6 +275,7 @@ pub fn receive(options: Options<'_>) -> Result<()> {
             drop(stream);
         };
         drop(listener); // A single sender per acquisition.
+        drop(firewall); // the established connection stays allowed (conntrack)
         manifest.peer = peer.to_string();
         stream.set_read_timeout(Some(options.timeout))?;
         copy_stream(

@@ -262,6 +262,7 @@ pub fn run(opts: Options) -> Result<u8> {
     let output = check_output(opts.output, opts.allow_tmpfs)?;
     let listener = TcpListener::bind(opts.bind).context("Cannot bind the receiver")?;
     let local = listener.local_addr()?;
+    let firewall = crate::listen::open_for(local, "stream");
     let header = Header {
         action: "stream_receive".into(),
         case: opts.case,
@@ -288,6 +289,12 @@ pub fn run(opts: Options) -> Result<u8> {
         clocks: Clocks::default(),
     };
     let mut collection = Collection::create(&output, header)?;
+    if let Some(o) = &firewall.0 {
+        collection.footprint(FootprintEntry::new(
+            "firewall_open",
+            json!({ "rule": o.description, "removed": "when the receiver ends" }),
+        ))?;
+    }
     let mut code = dfstream::pairing_code()?;
     println!("[*] Listening on {local} -> {}", output.display());
     println!(
@@ -296,7 +303,16 @@ pub fn run(opts: Options) -> Result<u8> {
     );
     let mut failures = 0u32;
     let tally = loop {
-        let (conn, peer) = listener.accept().context("accept")?;
+        let (conn, peer) = match crate::listen::accept(&listener) {
+            Ok(c) => c,
+            Err(e) => {
+                let reason = format!("{e:#}");
+                collection.finish(Completion::Aborted {
+                    reason: reason.clone(),
+                })?;
+                anyhow::bail!(reason);
+            }
+        };
         conn.set_read_timeout(Some(PAIRING_TIMEOUT))?;
         conn.set_write_timeout(Some(PAIRING_TIMEOUT))?;
         let peer = peer.to_string();

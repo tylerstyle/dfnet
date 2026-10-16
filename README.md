@@ -117,6 +117,40 @@ Exit codes: 0 complete, 7 complete with packet loss, 6 dumpcap failed, 4
 nothing captured. Lawful interception runs on other systems; `--legal-basis`
 records the order this capture rests on.
 
+### Listening behind dfnix's firewall
+
+dfnix keeps the NixOS firewall on. While `dfnet stream` or `dfnet receive`
+listens, dfnet opens exactly the bound address and port: one ACCEPT rule at the
+top of INPUT, tagged `dfnet-listen:…`. It removes the rule when the listener
+ends. `receive` closes the opening as soon as its one sender is connected.
+Ctrl-C while waiting for a sender ends cleanly; a rule left by a killed run is
+removed at the next start. Loopback needs no opening. Without root, dfnet
+leaves the firewall alone and says so.
+
+### Temporary SSH access (`dfnet ssh`)
+
+dfnix runs no SSH server. For a headless server, `dfnet ssh` gives the
+examiner's laptop access for one session:
+
+```bash
+dfnet ssh start --key /media/kit/case01.pub --bind 10.0.0.1   # prints the host key fingerprint
+dfnet ssh status
+dfnet ssh stop
+```
+
+- **Who gets in.** A fresh ed25519 host key per session, whose fingerprint is
+  printed for the examiner to compare when connecting. Only the given public
+  keys log in, only as root; no passwords, no keyboard-interactive, no agent,
+  TCP or X11 forwarding.
+- **Where.** sshd listens on one address, never all interfaces, and the
+  firewall opens that address and port (`dfnet-ssh:<port>`).
+- **How it runs.** As the transient unit `dfnet-sshd`, logging verbosely
+  (every key fingerprint that logs in).
+- **Stopping.** `stop` ends sshd, closes the port, deletes the host key and the
+  keys, and writes `ssh_stop` to the audit log with every accepted login
+  (`ssh_start` records the keys, the host key and the firewall rule). sshd needs
+  its privilege separation user `sshd`, which dfnix provides.
+
 ### Audit trail
 
 Each reception appends `receive_started` and `receive_finished` records to the
@@ -235,10 +269,12 @@ cargo test --locked
 nix build .#dfnet
 nix develop
 nix build .#checks.x86_64-linux.pcap    # VM test: two machines, dfnet pcap
+nix build .#checks.x86_64-linux.listen  # VM test: listeners behind the NixOS firewall
+nix build .#checks.x86_64-linux.ssh     # VM test: dfnet ssh
 ```
 
 Runtime dependencies: `iproute2`, `dumpcap` (wireshark-cli) and `ethtool` for
-`dfnet pcap`, NetworkManager (including its hotspot DHCP/DNS
+`dfnet pcap`, OpenSSH for `dfnet ssh`, NetworkManager (including its hotspot DHCP/DNS
 support), `iptables`/`ip6tables`, `macchanger`, `arp-scan`, `cifs-utils`, and `nfs-utils`.
 The Nix package wraps the executable with its command dependencies; the host must
 still run NetworkManager and support AP mode and both firewall families.

@@ -30,6 +30,8 @@
 
         checks = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           pcap = import ./tests/pcap.nix { inherit pkgs dfnet; };
+          listen = import ./tests/listen.nix { inherit pkgs dfnet; };
+          ssh = import ./tests/ssh.nix { inherit pkgs dfnet; };
         };
 
         apps = {

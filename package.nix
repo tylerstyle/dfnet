@@ -14,6 +14,7 @@
 , nftables
 , wireshark-cli
 , ethtool
+, openssh
   # dfcore and dflive (for dfstream) are sibling path dependencies; flakes
   # pass their inputs
 , dfcoreSrc ? ../dfcore
@@ -69,6 +70,7 @@ rustPlatform.buildRustPackage {
         nftables
         wireshark-cli # dumpcap for dfnet pcap
         ethtool
+        openssh # sshd and ssh-keygen for dfnet ssh
       ]}
 
     wrapProgram $out/bin/dfnet-cli \
