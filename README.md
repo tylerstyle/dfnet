@@ -87,6 +87,36 @@ the sender allowlist is address-based and the hash check is what proves integrit
 use a trusted acquisition network or an authenticated transport/tunnel. A hash
 record does not replace source identification or an examiner's acquisition log.
 
+### Network traffic at the scene (`dfnet pcap`)
+
+```bash
+dfnet pcap eth1 --silent -o /media/target/case01/pcap \
+  -C "VG 12345/26" -E net01 -e "KHK Muster" --legal-basis "order ..." \
+  -f "host 192.0.2.7" --duration 3600
+```
+
+dfnet runs dumpcap and puts the capture into a dfcore collection:
+
+- **Files.** pcapng files of `--file-size` MiB (default 1024). Each file is
+  hashed (SHA-256) as soon as dumpcap closes it. Old files are never replaced.
+- **The interface as it was.** Driver, link, MAC, addresses and offload
+  settings are recorded. GRO and LRO merge received packets, so the capture would
+  no longer show the frames as they were on the wire; they are switched off for
+  the capture and restored afterwards (`--keep-offloads` leaves them on). Every
+  change and every restoration is in the footprint.
+- **Silent capture.** `--silent`, for a SPAN port or a tap, stops the interface
+  from sending anything: ARP off, IPv6 off. The interface must have no IPv4
+  address. Both settings are restored afterwards.
+- **Loss.** dumpcap's counts of packets captured and dropped (pcap, dumpcap,
+  interface) and the card's own missed/FIFO/overrun counters, before and after,
+  are recorded. Any loss makes the capture incomplete: exit 7.
+- **Stopping.** At `--duration`, on Ctrl-C/SIGTERM, or when less than 512 MiB
+  is free on the target. The collection is finished in every case.
+
+Exit codes: 0 complete, 7 complete with packet loss, 6 dumpcap failed, 4
+nothing captured. Lawful interception runs on other systems; `--legal-basis`
+records the order this capture rests on.
+
 ### Audit trail
 
 Each reception appends `receive_started` and `receive_finished` records to the
@@ -204,9 +234,11 @@ cargo test --locked
 
 nix build .#dfnet
 nix develop
+nix build .#checks.x86_64-linux.pcap    # VM test: two machines, dfnet pcap
 ```
 
-Runtime dependencies: `iproute2`, NetworkManager (including its hotspot DHCP/DNS
+Runtime dependencies: `iproute2`, `dumpcap` (wireshark-cli) and `ethtool` for
+`dfnet pcap`, NetworkManager (including its hotspot DHCP/DNS
 support), `iptables`/`ip6tables`, `macchanger`, `arp-scan`, `cifs-utils`, and `nfs-utils`.
 The Nix package wraps the executable with its command dependencies; the host must
 still run NetworkManager and support AP mode and both firewall families.

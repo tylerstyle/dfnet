@@ -22,6 +22,7 @@ use std::{
 };
 
 mod audit;
+mod pcap;
 mod receive;
 mod routing;
 mod stream;
@@ -122,6 +123,53 @@ enum Commands {
         /// Abort if the sender stalls for this many seconds
         #[arg(long, default_value = "120", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
+    },
+    /// Capture network traffic at the scene with dumpcap: pcapng files hashed
+    /// as they close, interface and drop counters recorded
+    Pcap {
+        /// Interface to capture on (a SPAN port or tap: add --silent)
+        iface: String,
+        /// New directory for the capture files and their records (on a target drive)
+        #[arg(long, short = 'o')]
+        output: std::path::PathBuf,
+        /// Case number
+        #[arg(long, short = 'C')]
+        case: String,
+        /// Evidence number
+        #[arg(long, short = 'E')]
+        evidence: String,
+        /// Examiner name or ID
+        #[arg(long, short = 'e')]
+        examiner: String,
+        /// Legal basis of the capture (order, date)
+        #[arg(long)]
+        legal_basis: Option<String>,
+        /// Capture filter (BPF), e.g. "host 192.0.2.7"
+        #[arg(long, short = 'f')]
+        filter: Option<String>,
+        /// Size of each capture file in MiB
+        #[arg(long, default_value = "1024", value_parser = clap::value_parser!(u64).range(1..))]
+        file_size: u64,
+        /// Stop after this many seconds (default: Ctrl-C)
+        #[arg(long)]
+        duration: Option<u64>,
+        /// Bytes kept per packet (default: whole packets)
+        #[arg(long)]
+        snaplen: Option<u32>,
+        /// Don't put the interface into promiscuous mode
+        #[arg(long)]
+        no_promiscuous: bool,
+        /// Make the interface send nothing during the capture (ARP and IPv6
+        /// off); it must have no IPv4 address. Restored afterwards
+        #[arg(long)]
+        silent: bool,
+        /// Leave GRO/LRO on (they merge received packets; off by default
+        /// during the capture and restored afterwards)
+        #[arg(long)]
+        keep_offloads: bool,
+        /// Accept an output directory in RAM (tmpfs)
+        #[arg(long)]
+        allow_tmpfs: bool,
     },
     /// Create, stop, or inspect forensic Wi-Fi Access Point (Hotspot)
     Hotspot {
@@ -2197,6 +2245,45 @@ fn main() -> Result<()> {
                 allowed_peers: &allow_peer,
                 timeout: Duration::from_secs(timeout),
             })?;
+        }
+        Some(Commands::Pcap {
+            iface,
+            output,
+            case,
+            evidence,
+            examiner,
+            legal_basis,
+            filter,
+            file_size,
+            duration,
+            snaplen,
+            no_promiscuous,
+            silent,
+            keep_offloads,
+            allow_tmpfs,
+        }) => {
+            let code = pcap::run(pcap::Options {
+                iface: &iface,
+                output: &output,
+                case: dfcore::manifest::Case {
+                    case_number: case,
+                    evidence_number: evidence,
+                    examiner,
+                    ..Default::default()
+                },
+                legal_basis,
+                filter,
+                file_size_mib: file_size,
+                duration,
+                snaplen,
+                promiscuous: !no_promiscuous,
+                silent,
+                keep_offloads,
+                allow_tmpfs,
+            })?;
+            if code != 0 {
+                std::process::exit(i32::from(code));
+            }
         }
         Some(Commands::Stream {
             bind,

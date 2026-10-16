@@ -12,6 +12,8 @@
 , iptables
 , procps
 , nftables
+, wireshark-cli
+, ethtool
   # dfcore and dflive (for dfstream) are sibling path dependencies; flakes
   # pass their inputs
 , dfcoreSrc ? ../dfcore
@@ -65,6 +67,8 @@ rustPlatform.buildRustPackage {
         iptables
         procps
         nftables
+        wireshark-cli # dumpcap for dfnet pcap
+        ethtool
       ]}
 
     wrapProgram $out/bin/dfnet-cli \

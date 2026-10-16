@@ -52,7 +52,7 @@ fn statfs_magic(path: &Path) -> Result<u64> {
 }
 
 /// The output directory must be new or empty and not in RAM.
-fn check_output(output: &Path, allow_tmpfs: bool) -> Result<PathBuf> {
+pub(crate) fn check_output(output: &Path, allow_tmpfs: bool) -> Result<PathBuf> {
     let output = std::path::absolute(output)?;
     if output.exists() && std::fs::read_dir(&output)?.next().is_some() {
         return Err(dfcore::Refusal(format!(

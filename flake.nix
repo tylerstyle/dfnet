@@ -28,6 +28,10 @@
           dfnet = dfnet;
         };
 
+        checks = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          pcap = import ./tests/pcap.nix { inherit pkgs dfnet; };
+        };
+
         apps = {
           default = flake-utils.lib.mkApp {
             drv = dfnet;
