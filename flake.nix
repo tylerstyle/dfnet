@@ -9,13 +9,18 @@
       url = "github:tylerstyle/dfcore";
       flake = false;
     };
+    # dfstream/1 protocol crate, a sibling Cargo path dependency (../dflive/dfstream)
+    dflive = {
+      url = "github:tylerstyle/dflive";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, dfcore }:
+  outputs = { self, nixpkgs, flake-utils, dfcore, dflive }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        dfnet = pkgs.callPackage ./package.nix { dfcoreSrc = dfcore; };
+        dfnet = pkgs.callPackage ./package.nix { dfcoreSrc = dfcore; dfliveSrc = dflive; };
       in
       {
         packages = {

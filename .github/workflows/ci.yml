@@ -22,6 +22,12 @@ jobs:
           git clone https://github.com/tylerstyle/dfcore.git ../dfcore
           git -C ../dfcore checkout --detach "$rev"
 
+      - name: Checkout sibling dflive (dfstream) at the locked revision
+        run: |
+          rev=$(jq -r '.nodes.dflive.locked.rev' flake.lock)
+          git clone https://github.com/tylerstyle/dflive.git ../dflive
+          git -C ../dflive checkout --detach "$rev"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:

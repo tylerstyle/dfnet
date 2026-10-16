@@ -24,6 +24,7 @@ use std::{
 mod audit;
 mod receive;
 mod routing;
+mod stream;
 
 use routing::{
     enable_isolated_routing, enable_nat_routing, get_default_gateway_interface, get_routing_status,
@@ -93,6 +94,33 @@ enum Commands {
         allow_peer: Vec<std::net::IpAddr>,
         /// Abort if the sender stalls for this many seconds
         #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
+    },
+    /// Receive authenticated, encrypted streams from `dflive send` on a running
+    /// system (dfstream/1: shows a pairing code for the sender)
+    Stream {
+        /// Local address to listen on (never 0.0.0.0 / ::)
+        #[arg(long)]
+        bind: std::net::IpAddr,
+        #[arg(long, default_value = "9998")]
+        port: u16,
+        /// New directory for the streams and their records (on a target drive)
+        #[arg(long, short = 'o')]
+        output: std::path::PathBuf,
+        /// Case number
+        #[arg(long, short = 'C')]
+        case: String,
+        /// Evidence number
+        #[arg(long, short = 'E')]
+        evidence: String,
+        /// Examiner name or ID
+        #[arg(long, short = 'e')]
+        examiner: String,
+        /// Accept an output directory in RAM (tmpfs)
+        #[arg(long)]
+        allow_tmpfs: bool,
+        /// Abort if the sender stalls for this many seconds
+        #[arg(long, default_value = "120", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
     },
     /// Create, stop, or inspect forensic Wi-Fi Access Point (Hotspot)
@@ -2169,6 +2197,32 @@ fn main() -> Result<()> {
                 allowed_peers: &allow_peer,
                 timeout: Duration::from_secs(timeout),
             })?;
+        }
+        Some(Commands::Stream {
+            bind,
+            port,
+            output,
+            case,
+            evidence,
+            examiner,
+            allow_tmpfs,
+            timeout,
+        }) => {
+            let code = stream::run(stream::Options {
+                bind: std::net::SocketAddr::new(bind, port),
+                output: &output,
+                case: dfcore::manifest::Case {
+                    case_number: case,
+                    evidence_number: evidence,
+                    examiner,
+                    ..Default::default()
+                },
+                allow_tmpfs,
+                timeout: Duration::from_secs(timeout),
+            })?;
+            if code != 0 {
+                std::process::exit(i32::from(code));
+            }
         }
         Some(Commands::Hotspot { action }) => match action.unwrap_or(HotspotAction::Status) {
             HotspotAction::Start {

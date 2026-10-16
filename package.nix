@@ -12,8 +12,10 @@
 , iptables
 , procps
 , nftables
-  # dfcore is a sibling path dependency (../dfcore); flakes pass their input
+  # dfcore and dflive (for dfstream) are sibling path dependencies; flakes
+  # pass their inputs
 , dfcoreSrc ? ../dfcore
+, dfliveSrc ? ../dflive
 }:
 
 let
@@ -26,6 +28,7 @@ let
     mkdir -p $out
     cp -r ${clean ./.} $out/dfnet
     cp -r ${clean dfcoreSrc} $out/dfcore
+    cp -r ${clean dfliveSrc} $out/dflive
     chmod -R u+w $out
   '';
 in

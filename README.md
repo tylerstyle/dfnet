@@ -7,6 +7,39 @@ require root; receiving into a writable directory on an unprivileged port does n
 
 ## Acquisition
 
+### Authenticated streams from a running system (`dfnet stream`)
+
+For a running suspect system, use `dfnet stream` with
+[`dflive send`](https://github.com/tylerstyle/dflive) on the suspect side.
+dfnet shows a one-time pairing code; the examiner types it into dflive. Both sides
+run SPAKE2 on the code, so nobody on the network learns it or can join, and every
+frame after that is encrypted and authenticated (ChaCha20-Poly1305). Lengths need
+not be known in advance, and one session can carry several streams.
+
+```bash
+dfnet stream --bind 10.42.0.1 -o /media/target/case01/live \
+  -C "VG 12345/26" -E live01 -e "KHK Muster"
+# [*] Pairing code: 482 913 0576
+
+# On the suspect system, from the field kit:
+dflive send /dev/nvme0n1 --to 10.42.0.1:9998 --code "482 913 0576"
+```
+
+- The output directory must be new or empty and not in RAM (`--allow-tmpfs`).
+- Each stream becomes `NNN-<name>.raw` and an item of a dfcore collection
+  (`manifest.json`, `items.jsonl`, `footprint.jsonl`, `items.csv`, audit copy;
+  `dfcollect verify` checks it) with the sender's and the receiver's SHA-256, the
+  source's identity and the sender's read errors.
+- A stream counts only when the sender's end record arrived and byte counts and
+  hashes match. Each file is written as `*.incomplete` and renamed only then, so an
+  interruption of any kind never leaves a file that looks complete; anything else is
+  recorded as an error.
+- Failed pairings are recorded; after three, dfnet shows a new code.
+- Exit codes: 0 complete, 4 nothing arrived, 5 hashes differ, 6 incomplete,
+  7 complete but the sender zero-filled unreadable sectors.
+
+### Raw TCP streams (`dfnet receive`)
+
 The receiver uses buffered Rust I/O and computes SHA-256 as data is written. It
 accepts one TCP connection, refuses existing images or sidecars (including symlinks),
 and creates files with owner-only permissions. The output directory must exist.
