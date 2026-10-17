@@ -16,7 +16,7 @@ use ratatui::{
     Terminal,
 };
 use std::{
-    io,
+    io::{self, IsTerminal, Write},
     process::Command,
     time::{Duration, Instant},
 };
@@ -838,6 +838,54 @@ impl HotspotSnapshot {
     }
 }
 
+/// Result of polling an input file descriptor with `libc::poll`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollStdin {
+    Ready,
+    Timeout,
+    Interrupted,
+    Hangup,
+}
+
+/// Wait up to `timeout` for input on `fd`, without crossterm.
+///
+/// Crossterm 0.29's unix mio event source (`src/event/source/unix/mio.rs:94-121`)
+/// loops forever when the controlling terminal hangs up and `tty.read` returns
+/// `Ok(0)` or `Err(EIO)`, because that loop only breaks on `WouldBlock`. Checking
+/// `fd` with `libc::poll` first lets us detect `POLLHUP | POLLERR | POLLNVAL` and
+/// leave the TUI cleanly instead of spinning at 100% CPU.
+///
+/// Note on the remaining race: if a hangup occurs in the narrow window after
+/// `libc::poll` returns `POLLIN` and before `crossterm::event::read` finishes
+/// reading the tty, crossterm could still enter its read loop.
+fn poll_fd(fd: std::os::fd::RawFd, timeout: Duration) -> PollStdin {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: `pfd` is a valid single `pollfd` struct on the stack.
+    let ret = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if ret < 0 {
+        if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            PollStdin::Interrupted
+        } else {
+            PollStdin::Hangup
+        }
+    } else if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+        PollStdin::Hangup
+    } else if (pfd.revents & libc::POLLIN) != 0 {
+        PollStdin::Ready
+    } else {
+        PollStdin::Timeout
+    }
+}
+
+fn poll_stdin(timeout: Duration) -> PollStdin {
+    poll_fd(libc::STDIN_FILENO, timeout)
+}
+
 struct TerminalCleanup;
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
@@ -847,10 +895,16 @@ impl Drop for TerminalCleanup {
 }
 
 fn run_tui() -> Result<()> {
+    anyhow::ensure!(
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+        "Interactive TUI requires a terminal (stdin and stdout must be a tty)"
+    );
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        }
         default_panic(info);
     }));
 
@@ -917,7 +971,8 @@ fn run_tui() -> Result<()> {
     let mut last_chunks = [ratatui::layout::Rect::default(); 5];
 
     let mut hotspot_snapshot: Option<HotspotSnapshot> = None;
-    loop {
+    let mut hung_up = false;
+    'tui: loop {
         selected_wifi_idx = selected_wifi_idx.min(wifi_devs.len().saturating_sub(1));
         if current_tab == 3 {
             if let Some(device) = wifi_devs.get(selected_wifi_idx) {
@@ -928,10 +983,11 @@ fn run_tui() -> Result<()> {
                 }
             }
         }
-        terminal.draw(|f| {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
+        if terminal
+            .draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
                     Constraint::Length(3), // Title
                     Constraint::Length(3), // Tab navigation
                     Constraint::Min(8),    // Content
@@ -1455,10 +1511,41 @@ fn run_tui() -> Result<()> {
                 ]))
             };
             f.render_widget(footer, chunks[4]);
-        })?;
+        })
+        .is_err()
+        {
+            hung_up = true;
+            break 'tui;
+        }
 
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
+        match poll_stdin(Duration::from_millis(200)) {
+            PollStdin::Hangup => {
+                hung_up = true;
+                break 'tui;
+            }
+            PollStdin::Timeout | PollStdin::Interrupted => continue 'tui,
+            PollStdin::Ready => {}
+        }
+
+        loop {
+            let has_event = match event::poll(Duration::ZERO) {
+                Ok(b) => b,
+                Err(_) => {
+                    hung_up = true;
+                    break 'tui;
+                }
+            };
+            if !has_event {
+                break;
+            }
+            let ev = match event::read() {
+                Ok(ev) => ev,
+                Err(_) => {
+                    hung_up = true;
+                    break 'tui;
+                }
+            };
+            match ev {
                 Event::Mouse(mouse) => {
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -1688,7 +1775,7 @@ fn run_tui() -> Result<()> {
                     }
 
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('q') | KeyCode::Esc => break 'tui,
                         KeyCode::Tab => {
                             current_tab = (current_tab + 1) % tab_categories.len();
                             is_editing_text = false;
@@ -2081,20 +2168,30 @@ fn run_tui() -> Result<()> {
                             }
                         }
                         KeyCode::Char('n') => {
-                            disable_raw_mode()?;
-                            execute!(
-                                terminal.backend_mut(),
-                                LeaveAlternateScreen,
-                                DisableMouseCapture
-                            )?;
+                            if disable_raw_mode().is_err()
+                                || execute!(
+                                    terminal.backend_mut(),
+                                    LeaveAlternateScreen,
+                                    DisableMouseCapture
+                                )
+                                .is_err()
+                            {
+                                hung_up = true;
+                                break 'tui;
+                            }
                             let _ = Command::new("nmtui").status();
-                            enable_raw_mode()?;
-                            execute!(
-                                terminal.backend_mut(),
-                                EnterAlternateScreen,
-                                EnableMouseCapture
-                            )?;
-                            terminal.clear()?;
+                            if enable_raw_mode().is_err()
+                                || execute!(
+                                    terminal.backend_mut(),
+                                    EnterAlternateScreen,
+                                    EnableMouseCapture
+                                )
+                                .is_err()
+                                || terminal.clear().is_err()
+                            {
+                                hung_up = true;
+                                break 'tui;
+                            }
                             ifaces = fetch_interfaces();
                             wifi_devs = fetch_wifi_devices();
                         }
@@ -2111,12 +2208,17 @@ fn run_tui() -> Result<()> {
                             }
                         },
                         KeyCode::Char('l') if current_tab == 2 => {
-                            disable_raw_mode()?;
-                            execute!(
-                                terminal.backend_mut(),
-                                LeaveAlternateScreen,
-                                DisableMouseCapture
-                            )?;
+                            if disable_raw_mode().is_err()
+                                || execute!(
+                                    terminal.backend_mut(),
+                                    LeaveAlternateScreen,
+                                    DisableMouseCapture
+                                )
+                                .is_err()
+                            {
+                                hung_up = true;
+                                break 'tui;
+                            }
                             let received = prompt_receive_args(
                                 &mut io::stdin().lock(),
                                 &mut io::stdout(),
@@ -2126,7 +2228,7 @@ fn run_tui() -> Result<()> {
                                 Ok(Command::new(std::env::current_exe()?).args(args).status()?)
                             });
                             if let Err(e) = &received {
-                                println!("[!] {e:#}");
+                                let _ = writeln!(io::stdout(), "[!] {e:#}");
                             }
                             is_error = !matches!(&received, Ok(status) if status.success());
                             status_msg = if is_error {
@@ -2135,13 +2237,18 @@ fn run_tui() -> Result<()> {
                                 "Reception finished; consult the manifest for verification status."
                             }
                             .into();
-                            enable_raw_mode()?;
-                            execute!(
-                                terminal.backend_mut(),
-                                EnterAlternateScreen,
-                                EnableMouseCapture
-                            )?;
-                            terminal.clear()?;
+                            if enable_raw_mode().is_err()
+                                || execute!(
+                                    terminal.backend_mut(),
+                                    EnterAlternateScreen,
+                                    EnableMouseCapture
+                                )
+                                .is_err()
+                                || terminal.clear().is_err()
+                            {
+                                hung_up = true;
+                                break 'tui;
+                            }
                         }
                         _ => {}
                     }
@@ -2151,12 +2258,19 @@ fn run_tui() -> Result<()> {
         }
     }
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    if hung_up {
+        // The terminal is gone. Dropping `terminal` would try to show the
+        // cursor and `eprintln!` the failure, which panics on a hung-up tty.
+        std::mem::forget(terminal);
+        std::mem::forget(_terminal_cleanup);
+    } else {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
+    }
     Ok(())
 }
 
@@ -2697,5 +2811,83 @@ mod main_tests {
             }) => {}
             _ => panic!("Expected RouteAction::Status"),
         }
+    }
+
+    fn make_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid two-element array for `libc::pipe`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: `pipe` returned two valid open file descriptors.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn poll_fd_reports_ready_timeout_and_hangup_on_pipe() {
+        use std::os::fd::AsRawFd;
+        let (r, w) = make_pipe();
+        assert_eq!(
+            poll_fd(r.as_raw_fd(), Duration::from_millis(10)),
+            PollStdin::Timeout
+        );
+
+        let byte = *b"x";
+        assert_eq!(
+            // SAFETY: valid fd and 1-byte buffer.
+            unsafe { libc::write(w.as_raw_fd(), byte.as_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(
+            poll_fd(r.as_raw_fd(), Duration::from_millis(10)),
+            PollStdin::Ready
+        );
+
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            // SAFETY: valid fd and 1-byte buffer.
+            unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), 1) },
+            1
+        );
+        drop(w);
+        assert_eq!(
+            poll_fd(r.as_raw_fd(), Duration::from_millis(10)),
+            PollStdin::Hangup
+        );
+    }
+
+    #[test]
+    fn poll_fd_reports_hangup_when_pty_master_closes() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: valid out-pointers for `openpty`; null name/termios/winsize.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            eprintln!("skipping openpty test (unavailable in this sandbox: {err})");
+            return;
+        }
+        // SAFETY: `openpty` succeeded and returned a valid master file descriptor.
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        // SAFETY: `openpty` succeeded and returned a valid slave file descriptor.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+
+        assert_eq!(
+            poll_fd(slave.as_raw_fd(), Duration::from_millis(10)),
+            PollStdin::Timeout
+        );
+        drop(master);
+        assert_eq!(
+            poll_fd(slave.as_raw_fd(), Duration::from_millis(50)),
+            PollStdin::Hangup
+        );
     }
 }

@@ -37,7 +37,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "dfnet";
-  version = "0.1.4";
+  version = "0.1.5";
 
   inherit src;
   sourceRoot = "dfnet-src/dfnet";

@@ -247,7 +247,7 @@ Use `1`–`4`, Tab/Shift+Tab, or the mouse to switch tabs; `r` refreshes and `q`
 
 Hotspot status is cached for two seconds; interface discovery uses a single JSON
 query to `ip`. Quitting the TUI leaves a running hotspot active; stop it explicitly
-with `dfnet hotspot stop`.
+with `dfnet hotspot stop`. When its terminal goes away, the TUI ends quietly.
 
 ## Compatibility commands
 
