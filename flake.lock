@@ -3,16 +3,32 @@
     "dfcore": {
       "flake": false,
       "locked": {
-        "lastModified": 1792010220,
-        "narHash": "sha256-CUcFeUqfEKERS9RU9Y039uP/1MAeMXiKRkIWgfiClLU=",
+        "lastModified": 1792160581,
+        "narHash": "sha256-v6eQ5kPuJdhDVS4PR5a/W+wgrqa6X8tbVmf850Y6UGs=",
         "owner": "tylerstyle",
         "repo": "dfcore",
-        "rev": "d1a97cd05bbf6fb95123f9236fae37ea352926cf",
+        "rev": "52d6ab2dcb9f2068f31970b4703dc78cf345f18d",
         "type": "github"
       },
       "original": {
         "owner": "tylerstyle",
         "repo": "dfcore",
+        "type": "github"
+      }
+    },
+    "dflive": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792221757,
+        "narHash": "sha256-cyYobQ86R0391z4ZLtP6s76lDTrUnEygmTGh2hMgqbg=",
+        "owner": "tylerstyle",
+        "repo": "dflive",
+        "rev": "dfc944c5316654d79c5f12c0b6e4a03de2b7bea2",
+        "type": "github"
+      },
+      "original": {
+        "owner": "tylerstyle",
+        "repo": "dflive",
         "type": "github"
       }
     },
@@ -53,6 +69,7 @@
     "root": {
       "inputs": {
         "dfcore": "dfcore",
+        "dflive": "dflive",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs"
       }
