@@ -38,7 +38,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "dfnet";
-  version = "0.1.6";
+  version = "0.1.7";
 
   inherit src;
   sourceRoot = "dfnet-src/dfnet";
@@ -91,23 +91,6 @@ rustPlatform.buildRustPackage {
         procps
         nftables
       ]}
-
-    # Desktop entry
-    mkdir -p $out/share/applications
-    cat > $out/share/applications/dfnet.desktop <<EOF
-[Desktop Entry]
-Version=1.0
-Name=dfnet Network Triage
-GenericName=Forensic Network Operations
-Comment=MAC spoofing, static IP setup (nmtui), network share mounting, raw disk reception, and Wi-Fi hotspot AP
-Exec=kitty --title "dfnet - Forensic Network Operations" sudo dfnet
-Icon=network-workgroup
-Terminal=false
-Type=Application
-Categories=System;Network;Forensics;Utility;
-Keywords=forensics;network;macchanger;nmtui;smb;nfs;hotspot;
-StartupNotify=true
-EOF
   '';
 
   meta = with lib; {
