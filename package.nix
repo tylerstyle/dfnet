@@ -15,6 +15,7 @@
 , wireshark-cli
 , ethtool
 , openssh
+, bash
   # dfcore and dflive (for dfstream) are sibling path dependencies; flakes
   # pass their inputs
 , dfcoreSrc ? ../dfcore
@@ -37,7 +38,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "dfnet";
-  version = "0.1.5";
+  version = "0.1.6";
 
   inherit src;
   sourceRoot = "dfnet-src/dfnet";
@@ -47,6 +48,9 @@ rustPlatform.buildRustPackage {
   };
 
   nativeBuildInputs = [ makeWrapper ];
+  # scripts/dfnet.sh starts with `#!/usr/bin/env bash`; with bash as a host input,
+  # patchShebangs points dfnet-cli at the store bash instead of /usr/bin/env
+  buildInputs = [ bash ];
 
   postInstall = ''
     # Install companion CLI helper

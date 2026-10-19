@@ -1,6 +1,6 @@
 [package]
 name = "dfnet"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Linux network triage, MAC management, read-only shares, verified stream reception and Wi-Fi AP TUI"
