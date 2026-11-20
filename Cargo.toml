@@ -6,7 +6,6 @@ authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Linux network triage, MAC management, read-only shares, verified stream reception and Wi-Fi AP TUI"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tylerstyle/dfnet"
-homepage = "https://github.com/tylerstyle/dfnet"
 readme = "README.md"
 keywords = ["forensics", "dfir", "network", "macchanger", "tui"]
 categories = ["command-line-utilities"]

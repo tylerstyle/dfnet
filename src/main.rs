@@ -592,18 +592,9 @@ fn fetch_uplink_interfaces(ap_iface: Option<&str>, wifi_names: &[String]) -> Vec
     let mut filtered: Vec<NetInterface> = all
         .into_iter()
         .filter(|iface| {
-            if iface.name == "lo" {
-                return false;
-            }
-            if let Some(ap) = ap_iface {
-                if iface.name == ap {
-                    return false;
-                }
-            }
-            if wifi_names.contains(&iface.name) {
-                return false;
-            }
-            true
+            iface.name != "lo"
+                && ap_iface != Some(iface.name.as_str())
+                && !wifi_names.contains(&iface.name)
         })
         .collect();
 
