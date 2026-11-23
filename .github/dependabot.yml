@@ -1,0 +1,32 @@
+version: 2
+
+# Cargo updates are intentionally omitted: dfnet references ../dfcore and
+# ../dflive/dfstream as sibling path dependencies, which Dependabot's
+# single-repo sandbox cannot fetch. Rust advisories are monitored by the
+# `audit` job in .github/workflows/ci.yml (PRs, pushes and weekly schedule).
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    ignore:
+      # dfcore and dflive are bumped deliberately alongside sibling releases
+      - dependency-name: "dfcore"
+      - dependency-name: "dflive"
+    groups:
+      nix-inputs:
+        patterns:
+          - "*"
